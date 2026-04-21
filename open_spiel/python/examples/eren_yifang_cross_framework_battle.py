@@ -39,86 +39,7 @@ from ach_paper_pytorch import (  # pylint: disable=g-import-not-at-top
 )
 
 
-RL_ACTION_TO_OPEN_SPIEL = {
-    0: 0,
-    1: 1,
-    2: 2,
-    3: 3,
-    4: 4,
-    5: 5,
-    6: 6,
-    7: 7,
-    8: 8,
-    9: None,   # draw/passive transition, never chosen on OpenSpiel player nodes.
-    10: 9,     # pong
-    11: 11,    # gong -> tile-specific kong resolved from legal actions.
-    12: 19,    # stand -> pass
-    13: 18,    # hu
-    14: 18,    # zimo
-}
-
-
-def _append_tile_count(row: np.ndarray, count: int) -> None:
-  row[:] = 0
-  if count > 0:
-    row[:count] = 1
-
-
-def _decode_open_spiel_discards(state_str: str, marker: str) -> List[int]:
-  if marker not in state_str:
-    return []
-  part = state_str.split(marker, maxsplit=1)[1]
-  part = part.split("|", maxsplit=1)[0].strip()
-  if not part:
-    return []
-  tiles = []
-  for token in part.split():
-    if token.endswith("W"):
-      tiles.append(int(token[:-1]) - 1)
-  return tiles
-
-
-def _parse_observation_string(obs_string: str) -> Dict[str, object]:
-  result: Dict[str, object] = {
-      "self_melds": [],
-      "opp_exposed": [],
-      "opp_concealed_kongs": 0,
-      "self_discards": _decode_open_spiel_discards(obs_string, "Self discards:"),
-      "opp_discards": _decode_open_spiel_discards(obs_string, "Opp discards:"),
-      "last_discard": None,
-  }
-
-  if "| Self melds:" in obs_string:
-    part = obs_string.split("| Self melds:", maxsplit=1)[1].split("|", maxsplit=1)[0]
-    for chunk in part.split("["):
-      if "]" not in chunk:
-        continue
-      inner = chunk.split("]", maxsplit=1)[0].strip()
-      if not inner:
-        continue
-      label, tile = inner.split()
-      result["self_melds"].append((label, int(tile[:-1]) - 1))
-
-  if "| Opp exposed:" in obs_string:
-    part = obs_string.split("| Opp exposed:", maxsplit=1)[1].split("|", maxsplit=1)[0]
-    for chunk in part.split("["):
-      if "]" not in chunk:
-        continue
-      inner = chunk.split("]", maxsplit=1)[0].strip()
-      if not inner:
-        continue
-      label, tile = inner.split()
-      result["opp_exposed"].append((label, int(tile[:-1]) - 1))
-
-  if "| Opp an-gang count:" in obs_string:
-    value = obs_string.split("| Opp an-gang count:", maxsplit=1)[1].split("|", maxsplit=1)[0].strip()
-    result["opp_concealed_kongs"] = int(value)
-
-  if "| Last discard:" in obs_string:
-    token = obs_string.split("| Last discard:", maxsplit=1)[1].split()[0]
-    result["last_discard"] = int(token[:-1]) - 1
-
-  return result
+RL_ACTION_TO_OPEN_SPIEL = {action: action for action in range(49)}
 
 
 class RLCardDMCWrapper:
@@ -131,55 +52,14 @@ class RLCardDMCWrapper:
       self.agent.set_device(self.device)
 
   def _build_obs(self, state: pyspiel.State, player: int) -> Dict[str, object]:
-    obs = np.zeros((4, 9, 4), dtype=np.int8)
-    obs_string = state.observation_string(player)
-    parsed = _parse_observation_string(obs_string)
-
-    hand_tensor = np.asarray(state.observation_tensor(player), dtype=np.float32)
-    image_size = 4 * 9 * 69
-    hand_map = hand_tensor[:image_size].reshape(69, 4, 9)[0].transpose(1, 0)
-    obs[0] = hand_map
-
-    for tile in parsed["self_discards"]:
-      row = obs[1, tile]
-      idx = int(row.sum())
-      if idx < 4:
-        row[idx] = 1
-    for tile in parsed["opp_discards"]:
-      row = obs[1, tile]
-      idx = int(row.sum())
-      if idx < 4:
-        row[idx] = 1
-
-    self_pile_index = 2
-    opp_pile_index = 3
-    for label, tile in parsed["self_melds"]:
-      count = 4 if label in ("MingGang", "AnGang") else 3
-      _append_tile_count(obs[self_pile_index, tile], count)
-    for label, tile in parsed["opp_exposed"]:
-      count = 4 if label == "MingGang" else 3
-      _append_tile_count(obs[opp_pile_index, tile], count)
-
+    obs = np.asarray(state.observation_tensor(player), dtype=np.int8).reshape(
+        state.get_game().observation_tensor_shape())
     return {"obs": obs}
 
   def _translate_action(self, rl_action: int, legal_actions: Sequence[int]) -> int:
-    if rl_action in range(9):
-      mapped = RL_ACTION_TO_OPEN_SPIEL[rl_action]
-      if mapped in legal_actions:
-        return mapped
-    elif rl_action == 10 and 9 in legal_actions:
-      return 9
-    elif rl_action == 11:
-      kong_actions = [action for action in legal_actions if 10 <= action <= 18]
-      if len(kong_actions) == 1:
-        return kong_actions[0]
-      if kong_actions:
-        return kong_actions[0]
-    elif rl_action in (13, 14) and 18 in legal_actions:
-      return 19
-    elif rl_action == 9 and 20 in legal_actions:
-      return 20
-
+    mapped = RL_ACTION_TO_OPEN_SPIEL.get(int(rl_action))
+    if mapped in legal_actions:
+      return mapped
     if len(legal_actions) == 1:
       return int(legal_actions[0])
     raise ValueError(
@@ -195,20 +75,9 @@ class RLCardDMCWrapper:
     return self._translate_action(int(action), legal_actions)
 
   def _to_rl_action(self, open_spiel_action: int, legal_actions: Sequence[int]) -> int:
-    if 0 <= open_spiel_action <= 8:
+    del legal_actions
+    if 0 <= open_spiel_action < 49:
       return open_spiel_action
-    if open_spiel_action == 9:
-      return 10
-    if 10 <= open_spiel_action <= 18:
-      return 11
-    if open_spiel_action == 18:
-      if 13 in RL_ACTION_TO_OPEN_SPIEL and 18 in legal_actions:
-        return 13
-      return 14
-    if open_spiel_action == 19:
-      return 12
-    if open_spiel_action == 20:
-      return 9
     raise ValueError(f"Unsupported OpenSpiel action: {open_spiel_action}")
 
 
