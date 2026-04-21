@@ -72,6 +72,8 @@ set(GAME_SOURCES
   dou_dizhu/dou_dizhu.h
   dou_dizhu/dou_dizhu_utils.cc
   dou_dizhu/dou_dizhu_utils.h
+  eren_yifang/eren_yifang.cc
+  eren_yifang/eren_yifang.h
   efg_game/efg_game.cc
   efg_game/efg_game.h
   efg_game/efg_game_data.cc
@@ -216,6 +218,8 @@ set(GAME_SOURCES
   y/y.h
   yacht/yacht.cc
   yacht/yacht.h
+  xueliu_erma/xueliu_erma.cc
+  xueliu_erma/xueliu_erma.h
 )
 
 if (${OPEN_SPIEL_BUILD_WITH_HANABI})
@@ -460,6 +464,10 @@ add_test(efg_game_test efg_game_test)
 add_executable(einstein_wurfelt_nicht_test einstein_wurfelt_nicht/einstein_wurfelt_nicht_test.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(einstein_wurfelt_nicht_test einstein_wurfelt_nicht_test)
+
+add_executable(eren_yifang_test eren_yifang/eren_yifang_test.cc ${OPEN_SPIEL_OBJECTS}
+               $<TARGET_OBJECTS:tests>)
+add_test(eren_yifang_test eren_yifang_test)
 
 add_executable(euchre_test euchre/euchre_test.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
@@ -714,3 +722,7 @@ add_test(y_test y_test)
 add_executable(yacht_test yacht/yacht_test.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(yacht_test yacht_test)
+
+add_executable(xueliu_erma_test xueliu_erma/xueliu_erma_test.cc ${OPEN_SPIEL_OBJECTS}
+               $<TARGET_OBJECTS:tests>)
+add_test(xueliu_erma_test xueliu_erma_test)
