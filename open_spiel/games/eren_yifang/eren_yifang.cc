@@ -749,8 +749,9 @@ std::vector<std::pair<Action, double>> ErenYifangState::ChanceOutcomes() const {
     return outcomes;
   }
 
-  SPIEL_CHECK_EQ(phase_, Phase::kPlay);
-  SPIEL_CHECK_EQ(play_phase_, PlayPhase::kDrawChance);
+  SPIEL_CHECK_EQ(static_cast<int>(phase_), static_cast<int>(Phase::kPlay));
+  SPIEL_CHECK_EQ(static_cast<int>(play_phase_),
+                 static_cast<int>(PlayPhase::kDrawChance));
   const int remaining = static_cast<int>(wall_.size()) - wall_pos_;
   SPIEL_CHECK_GT(remaining, 0);
   const double prob = 1.0 / remaining;
