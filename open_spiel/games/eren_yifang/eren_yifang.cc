@@ -418,10 +418,37 @@ void ErenYifangState::WriteObservationFeatures(Player player,
   SPIEL_CHECK_EQ(offset, kObservationTensorSize);
 }
 
+void ErenYifangState::WriteInformationStateFeatures(
+    Player player, absl::Span<float> values) const {
+  SPIEL_CHECK_EQ(values.size(), kInformationStateTensorSize);
+  std::fill(values.begin(), values.end(), 0.0f);
+
+  const int opponent = 1 - player;
+  int offset = 0;
+
+  values[offset + player] = 1.0f;
+  offset += kPositionFeatureChannels;
+
+  auto write_last_action_features = [&](int target_player) {
+    const Action last_action = last_actions_by_player_[target_player];
+    if (last_action != kInvalidAction) {
+      values[offset + last_action] = 1.0f;
+    }
+    offset += kNumDistinctActions;
+  };
+
+  write_last_action_features(player);
+  write_last_action_features(opponent);
+  SPIEL_CHECK_EQ(offset, kInformationStateTensorSize);
+}
+
 void ErenYifangState::RecordPublicActionEvent(Action action) {
   SPIEL_CHECK_GE(action, 0);
   SPIEL_CHECK_LT(action, kNumDistinctActions);
   last_action_ = action;
+  if (current_player_ >= 0 && current_player_ < kNumPlayers) {
+    last_actions_by_player_[current_player_] = action;
+  }
 }
 
 void ErenYifangState::ClearDiscardContext() {
@@ -620,7 +647,7 @@ void ErenYifangState::InformationStateTensor(Player player,
   SPIEL_CHECK_GE(player, 0);
   SPIEL_CHECK_LT(player, kNumPlayers);
   SPIEL_CHECK_EQ(values.size(), kInformationStateTensorSize);
-  WriteObservationFeatures(player, values);
+  WriteInformationStateFeatures(player, values);
 }
 
 std::string ErenYifangState::ObservationString(Player player) const {
@@ -1148,7 +1175,7 @@ ErenYifangGame::ErenYifangGame(const GameParameters& params)
     : Game(kGameType, params) {}
 
 std::vector<int> ErenYifangGame::InformationStateTensorShape() const {
-  return {kObservationChannels, kObservationHeight, kObservationWidth};
+  return {kInformationStateTensorSize};
 }
 
 std::vector<int> ErenYifangGame::ObservationTensorShape() const {

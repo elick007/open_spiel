@@ -55,13 +55,18 @@ inline constexpr int kAddGongActionEnd =
     kAddGongActionBase + kNumTileTypes - 1;
 inline constexpr int kNumDistinctActions = kAddGongActionEnd + 1;
 
-inline constexpr int kObservationChannels = 31;
+inline constexpr int kImageObservationChannels = 31;
+inline constexpr int kPositionFeatureChannels = kNumPlayers;
+inline constexpr int kLastActionFeatureChannels = kNumPlayers * kNumDistinctActions;
+inline constexpr int kAuxObservationChannels =
+    kPositionFeatureChannels + kLastActionFeatureChannels;
+inline constexpr int kObservationChannels = kImageObservationChannels;
 inline constexpr int kObservationHeight = 4;
 inline constexpr int kObservationWidth = kNumTileTypes;
 inline constexpr int kMaxTrackedDiscards = 13;
 inline constexpr int kObservationTensorSize =
     kObservationChannels * kObservationHeight * kObservationWidth;
-inline constexpr int kInformationStateTensorSize = kObservationTensorSize;
+inline constexpr int kInformationStateTensorSize = kAuxObservationChannels;
 
 enum class Phase {
   kDeal,
@@ -157,6 +162,8 @@ class ErenYifangState : public State {
   std::array<bool, kNumPlayers> discard_after_gong_{};
 
   Action last_action_ = kInvalidAction;
+  std::array<Action, kNumPlayers> last_actions_by_player_{
+      {kInvalidAction, kInvalidAction}};
   std::vector<double> returns_ = std::vector<double>(kNumPlayers, 0.0);
 
   std::string TileTypeToString(int tile_type) const;
@@ -179,6 +186,8 @@ class ErenYifangState : public State {
   int KongScore(int player) const;
 
   void WriteObservationFeatures(Player player, absl::Span<float> values) const;
+  void WriteInformationStateFeatures(Player player,
+                                     absl::Span<float> values) const;
   void RecordPublicActionEvent(Action action);
   void ClearDiscardContext();
   void ClearPendingAddGong();
