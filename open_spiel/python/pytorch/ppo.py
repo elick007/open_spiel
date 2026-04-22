@@ -59,15 +59,16 @@ class PPOAgent(nn.Module):
 
   def __init__(self, num_actions, observation_shape, device):
     super().__init__()
+    self._input_size = int(np.array(observation_shape).prod())
     self.critic = nn.Sequential(
-        layer_init(nn.Linear(np.array(observation_shape).prod(), 64)),
+        layer_init(nn.Linear(self._input_size, 64)),
         nn.Tanh(),
         layer_init(nn.Linear(64, 64)),
         nn.Tanh(),
         layer_init(nn.Linear(64, 1), std=1.0),
     )
     self.actor = nn.Sequential(
-        layer_init(nn.Linear(np.array(observation_shape).prod(), 64)),
+        layer_init(nn.Linear(self._input_size, 64)),
         nn.Tanh(),
         layer_init(nn.Linear(64, 64)),
         nn.Tanh(),
@@ -78,12 +79,13 @@ class PPOAgent(nn.Module):
     self.register_buffer("mask_value", torch.tensor(INVALID_ACTION_PENALTY))
 
   def get_value(self, x):
-    return self.critic(x)
+    return self.critic(torch.flatten(x, start_dim=1))
 
   def get_action_and_value(self, x, legal_actions_mask=None, action=None):
     if legal_actions_mask is None:
       legal_actions_mask = torch.ones((len(x), self.num_actions)).bool()
 
+    x = torch.flatten(x, start_dim=1)
     logits = self.actor(x)
     probs = CategoricalMasked(
         logits=logits, masks=legal_actions_mask, mask_value=self.mask_value)

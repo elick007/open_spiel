@@ -85,6 +85,21 @@ class PPOTest(absltest.TestCase):
       n_evaluations += sum(done)
     self.assertGreaterEqual(total_eval_reward, 900)
 
+  def test_multidimensional_observation_shape(self):
+    agent = PPOAgent(num_actions=4, observation_shape=(3, 2), device="cpu")
+    obs = torch.randn(5, 3, 2)
+    legal_actions_mask = torch.ones((5, 4), dtype=torch.bool)
+
+    action, logprob, entropy, value, probs = agent.get_action_and_value(
+        obs, legal_actions_mask=legal_actions_mask)
+
+    self.assertEqual(action.shape, (5,))
+    self.assertEqual(logprob.shape, (5,))
+    self.assertEqual(entropy.shape, (5,))
+    self.assertEqual(value.shape, (5, 1))
+    self.assertEqual(probs.shape, (5, 4))
+    self.assertEqual(agent.get_value(obs).shape, (5, 1))
+
 
 if __name__ == "__main__":
   random.seed(SEED)

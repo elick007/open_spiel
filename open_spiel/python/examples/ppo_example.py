@@ -49,7 +49,7 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string("exp_name",
                     os.path.basename(__file__).rstrip(".py"),
                     "the name of this experiment")
-flags.DEFINE_string("game_name", "atari", "the id of the OpenSpiel game")
+flags.DEFINE_string("game_name", "eren_yifang", "the id of the OpenSpiel game")
 flags.DEFINE_float("learning_rate", 2.5e-4,
                    "the learning rate of the optimizer")
 flags.DEFINE_integer("seed", 1, "seed of the experiment")
@@ -189,11 +189,11 @@ def main(_):
     agent_fn = PPOAgent
 
   game = envs.envs[0]._game  # pylint: disable=protected-access
-  info_state_shape = game.observation_tensor_shape()
+  input_shape = envs.observation_spec()["info_state"]
 
   num_updates = FLAGS.total_timesteps // batch_size
   agent = PPO(
-      input_shape=info_state_shape,
+      input_shape=input_shape,
       num_actions=game.num_distinct_actions(),
       num_players=game.num_players(),
       player_id=0,
