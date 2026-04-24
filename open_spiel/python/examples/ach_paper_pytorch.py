@@ -237,6 +237,16 @@ def _resolve_start_method(device: str,
   return "spawn"
 
 
+def _configure_torch_multiprocessing() -> None:
+  """Reduces file-descriptor pressure when sharing tensors with workers."""
+  if not sys.platform.startswith("linux"):
+    return
+  try:
+    torch.multiprocessing.set_sharing_strategy("file_system")
+  except (AttributeError, RuntimeError):
+    pass
+
+
 def _latest_checkpoint_path(checkpoint_dir: Path,
                             checkpoint_prefix: str,
                             game_name: str) -> Optional[Path]:
@@ -705,6 +715,8 @@ class PracticalACHAgent:
       game = pyspiel.load_game(game_name)
       return self.collect_batch(game, min_samples=min_samples)
 
+    _configure_torch_multiprocessing()
+
     worker_counts = _split_sample_count(min_samples, resolved_workers)
     agent_config = {
         "input_shape": self.input_shape,
@@ -1021,6 +1033,7 @@ def train_practical_ach(
   pool = None
 
   if use_parallel:
+    _configure_torch_multiprocessing()
     start_method = _resolve_start_method(agent.device, mp_start_method)
     print(
         f"Using {resolved_workers} worker processes for self-play collection "
