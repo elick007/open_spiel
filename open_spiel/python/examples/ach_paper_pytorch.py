@@ -17,12 +17,12 @@ so they can use the same backbone. When a game also exposes separate one-hot
 information-state features, those auxiliary features are read separately and
 concatenated after the CNN flattening step.
 
-It is still a synchronous trainer rather than the paper's full decoupled
-actor/learner system:
+The trainer uses persistent actor workers and a decoupled learner loop:
 
-- no asynchronous actors or learner;
-- one shared optimizer update loop per self-play batch;
-- optional multiprocessing for self-play collection on Linux;
+- actors collect self-play trajectories asynchronously from learner updates;
+- the learner consumes actor batches through a replay buffer and broadcasts weights;
+- multiprocessing actor collection is supported on Linux, macOS, and Windows;
+- game rules and action ids come from the loaded OpenSpiel game;
 - only turn-based sequential games are supported.
 
 Paper:
@@ -38,9 +38,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import multiprocessing as mp
 import os
 from pathlib import Path
+import queue
 import re
 import sys
 import time
+import traceback
 import numpy as np
 import pyspiel
 import torch
@@ -50,6 +52,16 @@ import torch.nn.functional as F
 
 
 INVALID_ACTION_LOGIT = -1e9
+
+PAPER_MAHJONG_BATCH_SIZE = 8192
+PAPER_MAHJONG_LEARNING_RATE = 2.5e-4
+PAPER_MAHJONG_GAMMA = 0.995
+PAPER_MAHJONG_GAE_LAMBDA = 0.95
+PAPER_MAHJONG_CLIP_RATIO = 0.5
+PAPER_MAHJONG_LOGIT_THRESHOLD = 6.0
+PAPER_MAHJONG_ENTROPY_COEF = 1e-2
+PAPER_MAHJONG_VALUE_COEF = 0.5
+PAPER_MAHJONG_ETA = 1.0
 
 
 def module_init(module: nn.Module,
@@ -198,6 +210,40 @@ class BatchTransition:
   return_: float
 
 
+class TransitionReplayBuffer:
+  """Bounded learner-side replay buffer for actor-generated transitions."""
+
+  def __init__(self, capacity: int, seed: Optional[int] = None):
+    self.capacity = max(1, int(capacity))
+    self._storage: List[BatchTransition] = []
+    self._rng = np.random.default_rng(seed)
+
+  def __len__(self) -> int:
+    return len(self._storage)
+
+  def add(self, transitions: Sequence[BatchTransition]) -> None:
+    if not transitions:
+      return
+    self._storage.extend(transitions)
+    overflow = len(self._storage) - self.capacity
+    if overflow > 0:
+      del self._storage[:overflow]
+
+  def can_sample(self, batch_size: int) -> bool:
+    return len(self._storage) >= batch_size
+
+  def sample(self, batch_size: int) -> List[BatchTransition]:
+    if batch_size <= 0:
+      raise ValueError("batch_size must be positive.")
+    if not self.can_sample(batch_size):
+      raise ValueError(
+          f"Replay buffer has {len(self._storage)} samples, "
+          f"needs {batch_size}.")
+    indices = self._rng.choice(
+        len(self._storage), size=batch_size, replace=False)
+    return [self._storage[int(index)] for index in indices]
+
+
 def _cpu_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
   """Returns a detached CPU snapshot that is safe to ship to worker processes."""
   return {
@@ -218,13 +264,11 @@ def _split_sample_count(total_samples: int, num_workers: int) -> List[int]:
 
 
 def _resolve_num_workers(num_workers: Optional[int]) -> int:
-  """Resolves the requested worker count, defaulting to Linux parallelism."""
+  """Resolves the requested worker count for cross-platform actor collection."""
   if num_workers is not None:
     return max(1, num_workers)
   cpu_count = os.cpu_count() or 1
-  if sys.platform.startswith("linux"):
-    return min(cpu_count, 4)
-  return 1
+  return min(cpu_count, 4)
 
 
 def _resolve_start_method(device: str,
@@ -235,6 +279,31 @@ def _resolve_start_method(device: str,
   if sys.platform.startswith("linux") and not str(device).startswith("cuda"):
     return "fork"
   return "spawn"
+
+
+def _configure_torch_multiprocessing() -> None:
+  """Reduces file-descriptor pressure when sharing tensors with workers."""
+  if not sys.platform.startswith("linux"):
+    return
+  try:
+    torch.multiprocessing.set_sharing_strategy("file_system")
+  except (AttributeError, RuntimeError):
+    pass
+
+
+def _actor_agent_config(agent: "PracticalACHAgent") -> Dict[str, object]:
+  """Returns the network and rollout config needed by actor workers."""
+  return {
+      "input_shape": agent.input_shape,
+      "action_size": agent.action_size,
+      "aux_feature_channels": agent.aux_feature_channels,
+      "conv_channels": agent.conv_channels,
+      "residual_blocks_per_stage": agent.residual_blocks_per_stage,
+      "shared_feature_size": agent.shared_feature_size,
+      "head_hidden_sizes": agent.head_hidden_sizes,
+      "gamma": agent.gamma,
+      "gae_lambda": agent.gae_lambda,
+  }
 
 
 def _latest_checkpoint_path(checkpoint_dir: Path,
@@ -428,14 +497,14 @@ class PracticalACHAgent:
       residual_blocks_per_stage: int = 3,
       shared_feature_size: int = 1024,
       head_hidden_sizes: Sequence[int] = (512, 512),
-      learning_rate: float = 3e-4,
-      gamma: float = 1.0,
-      gae_lambda: float = 0.95,
-      clip_ratio: float = 0.1,
-      logit_threshold: float = 2.0,
-      entropy_coef: float = 0.01,
-      value_coef: float = 0.5,
-      eta: float = 1.0,
+      learning_rate: float = PAPER_MAHJONG_LEARNING_RATE,
+      gamma: float = PAPER_MAHJONG_GAMMA,
+      gae_lambda: float = PAPER_MAHJONG_GAE_LAMBDA,
+      clip_ratio: float = PAPER_MAHJONG_CLIP_RATIO,
+      logit_threshold: float = PAPER_MAHJONG_LOGIT_THRESHOLD,
+      entropy_coef: float = PAPER_MAHJONG_ENTROPY_COEF,
+      value_coef: float = PAPER_MAHJONG_VALUE_COEF,
+      eta: float = PAPER_MAHJONG_ETA,
       max_grad_norm: float = 0.5,
       update_epochs: int = 1,
       num_minibatches: int = 1,
@@ -705,18 +774,10 @@ class PracticalACHAgent:
       game = pyspiel.load_game(game_name)
       return self.collect_batch(game, min_samples=min_samples)
 
+    _configure_torch_multiprocessing()
+
     worker_counts = _split_sample_count(min_samples, resolved_workers)
-    agent_config = {
-        "input_shape": self.input_shape,
-        "action_size": self.action_size,
-        "aux_feature_channels": self.aux_feature_channels,
-        "conv_channels": self.conv_channels,
-        "residual_blocks_per_stage": self.residual_blocks_per_stage,
-        "shared_feature_size": self.shared_feature_size,
-        "head_hidden_sizes": self.head_hidden_sizes,
-        "gamma": self.gamma,
-        "gae_lambda": self.gae_lambda,
-    }
+    agent_config = _actor_agent_config(self)
     network_state = _cpu_state_dict(self.network.state_dict())
     worker_args = []
     for worker_idx, worker_count in enumerate(worker_counts):
@@ -890,6 +951,21 @@ def _checkpoint_payload(agent: PracticalACHAgent,
   }
 
 
+def _build_rollout_agent(agent_config: Dict[str, object]) -> PracticalACHAgent:
+  """Builds a CPU rollout-only agent from learner configuration."""
+  return PracticalACHAgent(
+      input_shape=agent_config["input_shape"],
+      action_size=agent_config["action_size"],
+      aux_feature_channels=agent_config["aux_feature_channels"],
+      conv_channels=agent_config["conv_channels"],
+      residual_blocks_per_stage=agent_config["residual_blocks_per_stage"],
+      shared_feature_size=agent_config["shared_feature_size"],
+      head_hidden_sizes=agent_config["head_hidden_sizes"],
+      gamma=agent_config["gamma"],
+      gae_lambda=agent_config["gae_lambda"],
+      device="cpu")
+
+
 def _collect_batch_worker(worker_args) -> List[BatchTransition]:
   """Collects one self-play shard in a separate process."""
   (game_name, min_samples, worker_seed, agent_config,
@@ -901,19 +977,176 @@ def _collect_batch_worker(worker_args) -> List[BatchTransition]:
   torch.set_num_threads(1)
 
   game = pyspiel.load_game(game_name)
-  worker_agent = PracticalACHAgent(
-      input_shape=agent_config["input_shape"],
-      action_size=agent_config["action_size"],
-      aux_feature_channels=agent_config["aux_feature_channels"],
-      conv_channels=agent_config["conv_channels"],
-      residual_blocks_per_stage=agent_config["residual_blocks_per_stage"],
-      shared_feature_size=agent_config["shared_feature_size"],
-      head_hidden_sizes=agent_config["head_hidden_sizes"],
-      gamma=agent_config["gamma"],
-      gae_lambda=agent_config["gae_lambda"],
-      device="cpu")
+  worker_agent = _build_rollout_agent(agent_config)
   worker_agent.network.load_state_dict(network_state)
   return worker_agent.collect_batch(game, min_samples=min_samples)
+
+
+def _drain_latest_network_state(weights_queue) -> Optional[Dict[str, torch.Tensor]]:
+  """Returns the newest queued actor weights, dropping stale snapshots."""
+  latest_state = None
+  while True:
+    try:
+      latest_state = weights_queue.get_nowait()
+    except queue.Empty:
+      return latest_state
+
+
+def _put_latest_network_state(weights_queue,
+                              network_state: Dict[str, torch.Tensor]) -> None:
+  """Queues a fresh weight snapshot, replacing any older unconsumed snapshot."""
+  while True:
+    try:
+      weights_queue.get_nowait()
+    except queue.Empty:
+      break
+
+  try:
+    weights_queue.put_nowait(network_state)
+  except queue.Full:
+    try:
+      weights_queue.get_nowait()
+    except queue.Empty:
+      pass
+    try:
+      weights_queue.put(network_state, timeout=0.1)
+    except queue.Full:
+      pass
+
+
+def _put_actor_result(result_queue, stop_event, result) -> None:
+  """Puts an actor result while remaining responsive to shutdown."""
+  while not stop_event.is_set():
+    try:
+      result_queue.put(result, timeout=0.5)
+      return
+    except queue.Full:
+      continue
+
+
+def _async_actor_worker(worker_args) -> None:
+  """Runs a persistent self-play actor that streams batches to the learner."""
+  (actor_id, game_name, chunk_size, worker_seed, agent_config, network_state,
+   result_queue, weights_queue, stop_event) = worker_args
+
+  try:
+    if worker_seed is not None:
+      np.random.seed(worker_seed)
+      torch.manual_seed(worker_seed)
+    torch.set_num_threads(1)
+
+    game = pyspiel.load_game(game_name)
+    worker_agent = _build_rollout_agent(agent_config)
+    worker_agent.network.load_state_dict(network_state)
+
+    while not stop_event.is_set():
+      latest_state = _drain_latest_network_state(weights_queue)
+      if latest_state is not None:
+        worker_agent.network.load_state_dict(latest_state)
+
+      batch = worker_agent.collect_batch(game, min_samples=chunk_size)
+      _put_actor_result(result_queue, stop_event, ("batch", actor_id, batch))
+  except Exception:  # pylint: disable=broad-except
+    _put_actor_result(
+        result_queue,
+        stop_event,
+        ("error", actor_id, traceback.format_exc()))
+
+
+class AsyncActorPool:
+  """Persistent actor processes feeding rollout batches to one learner."""
+
+  def __init__(self,
+               game_name: str,
+               agent: PracticalACHAgent,
+               num_actors: int,
+               chunk_size: int,
+               seed: Optional[int] = None,
+               mp_start_method: Optional[str] = None,
+               queue_capacity: int = 2):
+    self.game_name = game_name
+    self.agent = agent
+    self.num_actors = max(1, int(num_actors))
+    self.chunk_size = max(1, int(chunk_size))
+    self.seed = seed
+    self.start_method = _resolve_start_method(agent.device, mp_start_method)
+    self.ctx = mp.get_context(self.start_method)
+    self.stop_event = self.ctx.Event()
+    result_capacity = max(self.num_actors, self.num_actors * queue_capacity)
+    self.result_queue = self.ctx.Queue(maxsize=result_capacity)
+    self.weight_queues = [
+        self.ctx.Queue(maxsize=1) for _ in range(self.num_actors)
+    ]
+    self.processes: List[mp.Process] = []
+
+  def start(self) -> None:
+    """Starts all actors with the learner's current network weights."""
+    if self.processes:
+      return
+
+    _configure_torch_multiprocessing()
+    agent_config = _actor_agent_config(self.agent)
+    network_state = _cpu_state_dict(self.agent.network.state_dict())
+    for actor_id in range(self.num_actors):
+      worker_seed = None if self.seed is None else self.seed + actor_id
+      worker_args = (
+          actor_id,
+          self.game_name,
+          self.chunk_size,
+          worker_seed,
+          agent_config,
+          network_state,
+          self.result_queue,
+          self.weight_queues[actor_id],
+          self.stop_event,
+      )
+      process = self.ctx.Process(
+          target=_async_actor_worker, args=(worker_args,), daemon=True)
+      process.start()
+      self.processes.append(process)
+
+  def broadcast_weights(self) -> None:
+    """Sends the learner's latest network weights to every actor."""
+    network_state = _cpu_state_dict(self.agent.network.state_dict())
+    for weights_queue in self.weight_queues:
+      _put_latest_network_state(weights_queue, network_state)
+
+  def get_result(self, timeout: float = 1.0):
+    """Returns one actor result, or raises if an actor has failed."""
+    try:
+      return self.result_queue.get(timeout=timeout)
+    except queue.Empty:
+      self.raise_for_failed_actors()
+      raise
+
+  def raise_for_failed_actors(self) -> None:
+    """Raises when an actor exits unexpectedly."""
+    if self.stop_event.is_set():
+      return
+    failed = [
+        (index, process.exitcode)
+        for index, process in enumerate(self.processes)
+        if process.exitcode is not None
+    ]
+    if failed:
+      raise RuntimeError(f"Actor process exited unexpectedly: {failed}")
+
+  def close(self) -> None:
+    """Stops actors and releases multiprocessing resources."""
+    self.stop_event.set()
+    for process in self.processes:
+      process.join(timeout=2.0)
+    for process in self.processes:
+      if process.is_alive():
+        process.terminate()
+        process.join(timeout=2.0)
+
+    for queue_obj in [self.result_queue, *self.weight_queues]:
+      try:
+        queue_obj.cancel_join_thread()
+        queue_obj.close()
+      except (AttributeError, OSError):
+        pass
 
 
 def evaluate_vs_random(agent: PracticalACHAgent,
@@ -963,7 +1196,11 @@ def evaluate_vs_random(agent: PracticalACHAgent,
 def train_practical_ach(
     game_name: str = "eren_yifang",
     num_iterations: int = 1000,
-    batch_size: int = 512,
+    batch_size: int = PAPER_MAHJONG_BATCH_SIZE,
+    replay_buffer_capacity: Optional[int] = None,
+    actor_batch_size: Optional[int] = None,
+    actor_update_interval: int = 1,
+    actor_queue_capacity: int = 2,
     eval_freq: int = 50,
     eval_games: int = 200,
     save_interval_seconds: float = 3600.0,
@@ -1017,33 +1254,61 @@ def train_practical_ach(
   last_completed_iteration = start_iteration
 
   resolved_workers = _resolve_num_workers(num_workers)
-  use_parallel = resolved_workers > 1
-  pool = None
-
-  if use_parallel:
-    start_method = _resolve_start_method(agent.device, mp_start_method)
-    print(
-        f"Using {resolved_workers} worker processes for self-play collection "
-        f"({start_method} start method)")
-    ctx = mp.get_context(start_method)
-    pool = ctx.Pool(processes=resolved_workers)
+  actor_chunk_size = actor_batch_size
+  if actor_chunk_size is None:
+    actor_chunk_size = max(1, batch_size // resolved_workers)
+  actor_chunk_size = max(1, int(actor_chunk_size))
+  actor_update_interval = max(1, int(actor_update_interval))
+  actor_queue_capacity = max(1, int(actor_queue_capacity))
+  if replay_buffer_capacity is None:
+    replay_buffer_capacity = max(
+        batch_size * 4,
+        resolved_workers * actor_chunk_size * actor_queue_capacity)
+  replay_buffer_capacity = max(batch_size, int(replay_buffer_capacity))
+  replay_buffer = TransitionReplayBuffer(
+      capacity=replay_buffer_capacity,
+      seed=None if seed is None else seed + 1000003)
+  actor_pool: Optional[AsyncActorPool] = None
 
   try:
+    if start_iteration < num_iterations:
+      actor_pool = AsyncActorPool(
+          game_name=game_name,
+          agent=agent,
+          num_actors=resolved_workers,
+          chunk_size=actor_chunk_size,
+          seed=seed,
+          mp_start_method=mp_start_method,
+          queue_capacity=actor_queue_capacity)
+      actor_pool.start()
+      print(
+          f"Using {resolved_workers} asynchronous actor process(es), "
+          f"chunk_size={actor_chunk_size}, "
+          f"replay_capacity={replay_buffer.capacity}, "
+          f"start_method={actor_pool.start_method}")
+
     for iteration in range(start_iteration + 1, num_iterations + 1):
-      if use_parallel:
-        iteration_seed = None
-        if seed is not None:
-          iteration_seed = seed + (iteration - 1) * resolved_workers
-        batch = agent.collect_batch_parallel(
-            game_name=game_name,
-            min_samples=batch_size,
-            num_workers=resolved_workers,
-            pool=pool,
-            worker_seed=iteration_seed)
-      else:
-        batch = agent.collect_batch(game, min_samples=batch_size)
+      while not replay_buffer.can_sample(batch_size):
+        if actor_pool is None:
+          raise RuntimeError("Actor pool was not started.")
+        try:
+          result = actor_pool.get_result(timeout=1.0)
+        except queue.Empty:
+          continue
+
+        result_type, actor_id, payload = result
+        if result_type == "error":
+          raise RuntimeError(
+              f"Actor {actor_id} failed while collecting self-play:\n{payload}")
+        if result_type != "batch":
+          raise RuntimeError(f"Unknown actor result type: {result_type!r}")
+        replay_buffer.add(payload)
+
+      batch = replay_buffer.sample(batch_size)
 
       metrics = agent.update(batch)
+      if actor_pool is not None and iteration % actor_update_interval == 0:
+        actor_pool.broadcast_weights()
       last_completed_iteration = iteration
 
       if eval_freq and iteration % eval_freq == 0:
@@ -1053,6 +1318,7 @@ def train_practical_ach(
           print(
               f"Iter {iteration:>5}/{num_iterations}  "
               f"Samples={len(batch):>4}  "
+              f"Replay={len(replay_buffer):>5}  "
               f"WinRate={win_rate:.0%}  "
               f"AvgRet={avg_return:+.3f}  "
               f"Loss={metrics['loss']:.4f}  "
@@ -1062,6 +1328,7 @@ def train_practical_ach(
           print(
               f"Iter {iteration:>5}/{num_iterations}  "
               f"Samples={len(batch):>4}  "
+              f"Replay={len(replay_buffer):>5}  "
               f"Loss={metrics['loss']:.4f}  "
               f"PiL={metrics['policy_loss']:.4f}  "
               f"VL={metrics['value_loss']:.4f}")
@@ -1077,9 +1344,8 @@ def train_practical_ach(
           last_saved_iteration = iteration
           print(f"Saved checkpoint: {checkpoint_path}")
   finally:
-    if pool is not None:
-      pool.close()
-      pool.join()
+    if actor_pool is not None:
+      actor_pool.close()
 
   if last_completed_iteration > start_iteration and (
       last_saved_iteration != last_completed_iteration):
@@ -1175,7 +1441,18 @@ def _parse_args() -> argparse.Namespace:
       default="eren_yifang",
       help="OpenSpiel game string. Defaults to eren_yifang.")
   parser.add_argument("--num_iterations", type=int, default=1000000)
-  parser.add_argument("--batch_size", type=int, default=1024)
+  parser.add_argument(
+      "--batch_size",
+      type=int,
+      default=PAPER_MAHJONG_BATCH_SIZE,
+      help="Learner batch size. Defaults to the paper's 1-on-1 Mahjong value.")
+  parser.add_argument(
+      "--replay_buffer_capacity",
+      type=int,
+      default=None,
+      help=(
+          "Maximum learner replay-buffer samples. Defaults to at least four "
+          "learner batches."))
   parser.add_argument("--eval_freq", type=int, default=1000)
   parser.add_argument("--eval_games", type=int, default=200)
   parser.add_argument("--save_interval_seconds", type=float, default=3600.0)
@@ -1186,7 +1463,30 @@ def _parse_args() -> argparse.Namespace:
       action="store_true",
       help="Start fresh instead of loading the newest matching checkpoint.")
   parser.add_argument("--seed", type=int, default=0)
-  parser.add_argument("--num_workers", type=int, default=1)
+  parser.add_argument(
+      "--num_workers",
+      type=int,
+      default=None,
+      help=(
+          "Number of asynchronous actor processes. Defaults to up to 4 local "
+          "CPU cores on all supported platforms."))
+  parser.add_argument(
+      "--actor_batch_size",
+      type=int,
+      default=None,
+      help=(
+          "Minimum samples each actor collects before sending a learner queue "
+          "item. Defaults to batch_size / num_workers."))
+  parser.add_argument(
+      "--actor_update_interval",
+      type=int,
+      default=1,
+      help="Learner updates between actor weight broadcasts.")
+  parser.add_argument(
+      "--actor_queue_capacity",
+      type=int,
+      default=2,
+      help="Maximum queued rollout chunks per actor before actors apply backpressure.")
   parser.add_argument("--mp_start_method", default=None)
   parser.add_argument(
       "--aux_feature_channels",
@@ -1216,14 +1516,22 @@ def _parse_args() -> argparse.Namespace:
       default="512,512",
       help="Comma-separated hidden sizes for policy/value heads after the CNN.")
 
-  parser.add_argument("--learning_rate", type=float, default=1e-4)
-  parser.add_argument("--gamma", type=float, default=0.99)
-  parser.add_argument("--gae_lambda", type=float, default=0.95)
-  parser.add_argument("--clip_ratio", type=float, default=0.05)
-  parser.add_argument("--logit_threshold", type=float, default=1.5)
-  parser.add_argument("--entropy_coef", type=float, default=0.02)
-  parser.add_argument("--value_coef", type=float, default=0.5)
-  parser.add_argument("--eta", type=float, default=1.0)
+  parser.add_argument(
+      "--learning_rate", type=float, default=PAPER_MAHJONG_LEARNING_RATE)
+  parser.add_argument("--gamma", type=float, default=PAPER_MAHJONG_GAMMA)
+  parser.add_argument(
+      "--gae_lambda", type=float, default=PAPER_MAHJONG_GAE_LAMBDA)
+  parser.add_argument(
+      "--clip_ratio", type=float, default=PAPER_MAHJONG_CLIP_RATIO)
+  parser.add_argument(
+      "--logit_threshold",
+      type=float,
+      default=PAPER_MAHJONG_LOGIT_THRESHOLD)
+  parser.add_argument(
+      "--entropy_coef", type=float, default=PAPER_MAHJONG_ENTROPY_COEF)
+  parser.add_argument(
+      "--value_coef", type=float, default=PAPER_MAHJONG_VALUE_COEF)
+  parser.add_argument("--eta", type=float, default=PAPER_MAHJONG_ETA)
   parser.add_argument("--max_grad_norm", type=float, default=0.5)
   parser.add_argument("--update_epochs", type=int, default=1)
   parser.add_argument("--num_minibatches", type=int, default=1)
@@ -1254,6 +1562,10 @@ def main() -> None:
       game_name=args.game_name,
       num_iterations=args.num_iterations,
       batch_size=args.batch_size,
+      replay_buffer_capacity=args.replay_buffer_capacity,
+      actor_batch_size=args.actor_batch_size,
+      actor_update_interval=args.actor_update_interval,
+      actor_queue_capacity=args.actor_queue_capacity,
       eval_freq=args.eval_freq,
       eval_games=args.eval_games,
       save_interval_seconds=args.save_interval_seconds,
