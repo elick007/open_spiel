@@ -12,17 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Example running PSRO on OpenSpiel Sequential games.
+"""Example running PSRO on OpenSpiel sequential games.
+
+By default this script is configured for `eren_yifang`, a two-player zero-sum
+stochastic imperfect-information game with a large chance tree. The defaults use
+an approximate DQN best-response oracle and a Nash meta-strategy, which are a
+better fit for this game than the exact tabular best-response defaults used for
+small poker games.
 
 To reproduce results from (Muller et al., "A Generalized Training Approach for
-Multiagent Learning", ICLR 2020; https://arxiv.org/abs/1909.12823), run this
-script with:
+Multiagent Learning", ICLR 2020; https://arxiv.org/abs/1909.12823), override the
+defaults with:
   - `game_name` in ['kuhn_poker', 'leduc_poker']
   - `n_players` in [2, 3, 4, 5]
   - `meta_strategy_method` in ['alpharank', 'uniform', 'nash', 'prd']
   - `rectifier` in ['', 'rectified']
-
-The other parameters keeping their default values.
+  - small-game settings such as `oracle_type=BR`, `sims_per_entry=1000`,
+    `gpsro_iterations=100`, and `exact_diagnostics=True`
 """
 
 import time
@@ -48,20 +54,22 @@ from open_spiel.python.algorithms.psro_v2 import strategy_selectors
 
 FLAGS = flags.FLAGS
 
+EREN_YIFANG_GAME_NAME = "eren_yifang"
+
 # Game-related
-flags.DEFINE_string("game_name", "kuhn_poker", "Game name.")
+flags.DEFINE_string("game_name", "eren_yifang", "Game name.")
 flags.DEFINE_integer("n_players", 2, "The number of players.")
 
 # PSRO related
-flags.DEFINE_string("meta_strategy_method", "alpharank",
+flags.DEFINE_string("meta_strategy_method", "nash",
                     "Name of meta strategy computation method.")
 flags.DEFINE_integer("number_policies_selected", 1,
                      "Number of new strategies trained at each PSRO iteration.")
-flags.DEFINE_integer("sims_per_entry", 1000,
+flags.DEFINE_integer("sims_per_entry", 2048,
                      ("Number of simulations to run to estimate each element"
                       "of the game outcome matrix."))
 
-flags.DEFINE_integer("gpsro_iterations", 100,
+flags.DEFINE_integer("gpsro_iterations", 20,
                      "Number of training steps for GPSRO.")
 flags.DEFINE_bool("symmetric_game", False, "Whether to consider the current "
                   "game as a symmetric game.")
@@ -83,33 +91,36 @@ flags.DEFINE_string("training_strategy_selector", "probabilistic",
                     "probability strategy available to each player.")
 
 # General (RL) agent parameters
-flags.DEFINE_string("oracle_type", "BR", "Choices are DQN, PG (Policy "
+flags.DEFINE_string("oracle_type", "DQN", "Choices are DQN, PG (Policy "
                     "Gradient) or BR (exact Best Response)")
-flags.DEFINE_integer("number_training_episodes", int(1e4), "Number training "
+flags.DEFINE_integer("number_training_episodes", int(2e4), "Number training "
                      "episodes per RL policy. Used for PG and DQN")
 flags.DEFINE_float("self_play_proportion", 0.0, "Self play proportion")
-flags.DEFINE_integer("hidden_layer_size", 256, "Hidden layer size")
-flags.DEFINE_integer("batch_size", 32, "Batch size")
+flags.DEFINE_integer("hidden_layer_size", 512, "Hidden layer size")
+flags.DEFINE_integer("batch_size", 128, "Batch size")
 flags.DEFINE_float("sigma", 0.0, "Policy copy noise (Gaussian Dropout term).")
 flags.DEFINE_string("optimizer_str", "adam", "'adam' or 'sgd'")
 
 # Policy Gradient Oracle related
 flags.DEFINE_string("loss_str", "qpg", "Name of loss used for BR training.")
 flags.DEFINE_integer("num_q_before_pi", 8, "# critic updates before Pi update")
-flags.DEFINE_integer("n_hidden_layers", 4, "# of hidden layers")
-flags.DEFINE_float("entropy_cost", 0.001, "Self play proportion")
-flags.DEFINE_float("critic_learning_rate", 1e-2, "Critic learning rate")
-flags.DEFINE_float("pi_learning_rate", 1e-3, "Policy learning rate.")
+flags.DEFINE_integer("n_hidden_layers", 3, "# of hidden layers")
+flags.DEFINE_float("entropy_cost", 0.01, "Entropy regularization cost.")
+flags.DEFINE_float("critic_learning_rate", 2.5e-4, "Critic learning rate")
+flags.DEFINE_float("pi_learning_rate", 2.5e-4, "Policy learning rate.")
 
 # DQN
-flags.DEFINE_float("dqn_learning_rate", 1e-2, "DQN learning rate.")
+flags.DEFINE_float("dqn_learning_rate", 2.5e-4, "DQN learning rate.")
 flags.DEFINE_integer("update_target_network_every", 1000, "Update target "
                      "network every [X] steps")
-flags.DEFINE_integer("learn_every", 10, "Learn every [X] steps.")
+flags.DEFINE_integer("learn_every", 4, "Learn every [X] steps.")
 
 # General
 flags.DEFINE_integer("seed", 1, "Seed.")
 flags.DEFINE_bool("local_launch", False, "Launch locally or not.")
+flags.DEFINE_bool("exact_diagnostics", False, "Compute exact NashConv and "
+                  "policy diversity diagnostics. This traverses the game tree "
+                  "and is intended for small games.")
 flags.DEFINE_bool("verbose", True, "Enables verbose printing and profiling.")
 
 
@@ -117,6 +128,7 @@ def init_pg_responder(env):
   """Initializes the Policy Gradient-based responder and agents."""
   info_state_size = env.observation_spec()["info_state"][0]
   num_actions = env.action_spec()["num_actions"]
+  num_players = env.game.num_players()
 
   agent_class = rl_policy.PGPolicy
 
@@ -145,7 +157,7 @@ def init_pg_responder(env):
           env,
           player_id,
           **agent_kwargs)
-      for player_id in range(FLAGS.n_players)
+      for player_id in range(num_players)
   ]
   for agent in agents:
     agent.freeze()
@@ -157,14 +169,15 @@ def init_br_responder(env):
   random_policy = policy.TabularPolicy(env.game)
   oracle = best_response_oracle.BestResponseOracle(
       game=env.game, policy=random_policy)
-  agents = [random_policy.__copy__() for _ in range(FLAGS.n_players)]
+  agents = [random_policy.__copy__() for _ in range(env.game.num_players())]
   return oracle, agents
 
 
 def init_dqn_responder(env):
-  """Initializes the Policy Gradient-based responder and agents."""
+  """Initializes the DQN-based responder and agents."""
   state_representation_size = env.observation_spec()["info_state"][0]
   num_actions = env.action_spec()["num_actions"]
+  num_players = env.game.num_players()
 
   agent_class = rl_policy.DQNPolicy
   agent_kwargs = {
@@ -190,7 +203,7 @@ def init_dqn_responder(env):
           env,
           player_id,
           **agent_kwargs)
-      for player_id in range(FLAGS.n_players)
+      for player_id in range(num_players)
   ]
   for agent in agents:
     agent.freeze()
@@ -257,6 +270,8 @@ def gpsro_looper(env, oracle, agents):
       symmetric_game=FLAGS.symmetric_game)
 
   start_time = time.time()
+  if FLAGS.verbose and not FLAGS.exact_diagnostics:
+    print("Exact exploitability and policy-diversity diagnostics disabled.")
   for gpsro_iteration in range(FLAGS.gpsro_iterations):
     if FLAGS.verbose:
       print("Iteration : {}".format(gpsro_iteration))
@@ -271,10 +286,11 @@ def gpsro_looper(env, oracle, agents):
       print("Probabilities : {}".format(meta_probabilities))
 
     # The following lines only work for sequential games for the moment.
-    if env.game.get_type().dynamics == pyspiel.GameType.Dynamics.SEQUENTIAL:
+    if (FLAGS.exact_diagnostics and
+        env.game.get_type().dynamics == pyspiel.GameType.Dynamics.SEQUENTIAL):
       aggregator = policy_aggregator.PolicyAggregator(env.game)
       aggr_policies = aggregator.aggregate(
-          range(FLAGS.n_players), policies, meta_probabilities)
+          range(env.game.num_players()), policies, meta_probabilities)
 
       exploitabilities, expl_per_player = exploitability.nash_conv(
           env.game, aggr_policies, return_only_nash_conv=False)
@@ -285,23 +301,41 @@ def gpsro_looper(env, oracle, agents):
         print("Exploitabilities per player : {}".format(expl_per_player))
 
 
+def load_turn_based_game(game_name, n_players):
+  """Loads `game_name`, only passing player count to games that accept it."""
+  if game_name == EREN_YIFANG_GAME_NAME:
+    return pyspiel.load_game_as_turn_based(game_name)
+  return pyspiel.load_game_as_turn_based(game_name, {"players": n_players})
+
+
+def make_rl_environment(game, game_name):
+  """Creates an RL environment with game-specific observation defaults."""
+  observation_type = None
+  if game_name == EREN_YIFANG_GAME_NAME:
+    observation_type = rl_environment.ObservationType.OBSERVATION
+  return rl_environment.Environment(game, observation_type=observation_type)
+
+
 def main(argv):
   if len(argv) > 1:
     raise app.UsageError("Too many command-line arguments.")
 
   np.random.seed(FLAGS.seed)
 
-  game = pyspiel.load_game_as_turn_based(FLAGS.game_name,
+  game = load_turn_based_game(FLAGS.game_name,
                                          {"players": FLAGS.n_players})
   env = rl_environment.Environment(game)
 
   # Initialize oracle and agents
-  if FLAGS.oracle_type == "DQN":
+  oracle_type = FLAGS.oracle_type.upper()
+  if oracle_type == "DQN":
     oracle, agents = init_dqn_responder(env)
-  elif FLAGS.oracle_type == "PG":
+  elif oracle_type == "PG":
     oracle, agents = init_pg_responder(env)
-  elif FLAGS.oracle_type == "BR":
+  elif oracle_type == "BR":
     oracle, agents = init_br_responder(env)
+  else:
+    raise ValueError("Unexpected oracle_type: {}".format(FLAGS.oracle_type))
   gpsro_looper(env, oracle, agents)
 
 

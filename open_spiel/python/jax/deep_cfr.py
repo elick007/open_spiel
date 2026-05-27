@@ -387,7 +387,7 @@ class DeepCFRSolver(policy.Policy):
           batch.legal_mask,
           batch.iteration,
       )
-      optimiser.update(advantage_model, grads)
+      optimiser.update(grads)
       return main_loss
 
     return update
@@ -424,7 +424,7 @@ class DeepCFRSolver(policy.Policy):
           batch.legal_mask,
           batch.iteration,
       )
-      optimiser.update(policy_model, grads)
+      optimiser.update(grads)
       return main_loss
 
     return update
@@ -667,7 +667,7 @@ class DeepCFRSolver(policy.Policy):
     def _train_step(graphdef, state, batch) -> tuple:
 
       # merge at the beginning of the function
-      model, optimiser = nn.merge(graphdef, state, copy=True)
+      model, optimiser = nn.merge(graphdef, state)
 
       loss = update_fn(model, optimiser, batch)
 

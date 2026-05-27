@@ -38,8 +38,10 @@ void ObservationFeatureTests() {
 
   const std::vector<int> information_state_shape =
       game->InformationStateTensorShape();
-  SPIEL_CHECK_EQ(information_state_shape.size(), 1);
-  SPIEL_CHECK_EQ(information_state_shape[0], kInformationStateTensorSize);
+  SPIEL_CHECK_EQ(information_state_shape.size(), 3);
+  SPIEL_CHECK_EQ(information_state_shape[0], kObservationChannels);
+  SPIEL_CHECK_EQ(information_state_shape[1], kObservationHeight);
+  SPIEL_CHECK_EQ(information_state_shape[2], kObservationWidth);
 
   std::unique_ptr<State> state = game->NewInitialState();
   while (state->IsChanceNode()) {
@@ -55,21 +57,22 @@ void ObservationFeatureTests() {
   const std::vector<float> obs1 = state->ObservationTensor(1);
   const std::vector<float> info0 = state->InformationStateTensor(0);
   const std::vector<float> info1 = state->InformationStateTensor(1);
-  const int position_offset = 0;
-  const int self_last_action_offset = position_offset + kPositionFeatureChannels;
-  const int opp_last_action_offset = self_last_action_offset + kNumDistinctActions;
 
   SPIEL_CHECK_EQ(static_cast<int>(obs0.size()), kObservationTensorSize);
   SPIEL_CHECK_EQ(static_cast<int>(obs1.size()), kObservationTensorSize);
   SPIEL_CHECK_EQ(static_cast<int>(info0.size()), kInformationStateTensorSize);
   SPIEL_CHECK_EQ(static_cast<int>(info1.size()), kInformationStateTensorSize);
-  SPIEL_CHECK_EQ(info0[position_offset + 0], 1.0f);
-  SPIEL_CHECK_EQ(info0[position_offset + 1], 0.0f);
-  SPIEL_CHECK_EQ(info1[position_offset + 0], 0.0f);
-  SPIEL_CHECK_EQ(info1[position_offset + 1], 1.0f);
+  SPIEL_CHECK_EQ(info0, obs0);
+  SPIEL_CHECK_EQ(info1, obs1);
 
-  SPIEL_CHECK_EQ(info0[self_last_action_offset + first_action], 1.0f);
-  SPIEL_CHECK_EQ(info1[opp_last_action_offset + first_action], 1.0f);
+  const int plane_size = kObservationHeight * kObservationWidth;
+  const int position_offset = kBaseObservationChannels * plane_size;
+  for (int index = 0; index < plane_size; ++index) {
+    SPIEL_CHECK_EQ(obs0[position_offset + index], 1.0f);
+    SPIEL_CHECK_EQ(obs0[position_offset + plane_size + index], 0.0f);
+    SPIEL_CHECK_EQ(obs1[position_offset + index], 0.0f);
+    SPIEL_CHECK_EQ(obs1[position_offset + plane_size + index], 1.0f);
+  }
 }
 
 }  // namespace

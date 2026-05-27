@@ -113,18 +113,10 @@ void WriteTileCountPlane(const std::array<int, kNumTileTypes>& counts,
   SPIEL_CHECK_EQ(values.size(), kObservationHeight * kObservationWidth);
   std::fill(values.begin(), values.end(), 0.0f);
   for (int tile = 0; tile < kNumTileTypes; ++tile) {
-    const int copies = std::min(counts[tile], kObservationHeight);
-    for (int row = 0; row < copies; ++row) {
-      values[row * kObservationWidth + tile] = 1.0f;
+    const int copies = std::min(counts[tile], kObservationWidth);
+    for (int copy = 0; copy < copies; ++copy) {
+      values[tile * kObservationWidth + copy] = 1.0f;
     }
-  }
-}
-
-void WriteSingleTilePlane(int tile_type, absl::Span<float> values) {
-  SPIEL_CHECK_EQ(values.size(), kObservationHeight * kObservationWidth);
-  std::fill(values.begin(), values.end(), 0.0f);
-  if (tile_type >= 0 && tile_type < kNumTileTypes) {
-    values[tile_type] = 1.0f;
   }
 }
 
@@ -342,31 +334,41 @@ int ErenYifangState::KongScore(int player) const {
   return score;
 }
 
+int ErenYifangState::FirstConcealedGongTile(int player) const {
+  for (int tile = 0; tile < kNumTileTypes; ++tile) {
+    if (hand_[player][tile] == kTilesPerKind) {
+      return tile;
+    }
+  }
+  return -1;
+}
+
+int ErenYifangState::FirstAddGongTile(int player) const {
+  for (const Meld& meld : melds_[player]) {
+    if (meld.type == MeldType::kPong &&
+        hand_[player][meld.tile_type] > 0) {
+      return meld.tile_type;
+    }
+  }
+  return -1;
+}
+
 void ErenYifangState::WriteObservationFeatures(Player player,
                                                absl::Span<float> values) const {
   SPIEL_CHECK_EQ(values.size(), kObservationTensorSize);
   std::fill(values.begin(), values.end(), 0.0f);
 
-  const int opponent = 1 - player;
-  std::array<int, kNumTileTypes> self_exposed{};
-  std::array<int, kNumTileTypes> self_hidden{};
-  std::array<int, kNumTileTypes> opp_exposed{};
-  std::array<int, kNumTileTypes> opp_hidden{};
-
-  auto accumulate_melds =
-      [&](int target_player, std::array<int, kNumTileTypes>& exposed,
-          std::array<int, kNumTileTypes>& hidden) {
-        for (const Meld& meld : melds_[target_player]) {
-          if (meld.type == MeldType::kConcealedGong) {
-            hidden[meld.tile_type] += 4;
-          } else {
-            exposed[meld.tile_type] += (meld.type == MeldType::kPong) ? 3 : 4;
-          }
-        }
-      };
-
-  accumulate_melds(player, self_exposed, self_hidden);
-  accumulate_melds(opponent, opp_exposed, opp_hidden);
+  std::array<int, kNumTileTypes> table_counts{};
+  std::array<std::array<int, kNumTileTypes>, kNumPlayers> pile_counts{};
+  for (int tile : table_) {
+    ++table_counts[tile];
+  }
+  for (int meld_player = 0; meld_player < kNumPlayers; ++meld_player) {
+    for (const Meld& meld : melds_[meld_player]) {
+      pile_counts[meld_player][meld.tile_type] +=
+          (meld.type == MeldType::kPong) ? 3 : 4;
+    }
+  }
 
   int offset = 0;
   const int plane_size = kObservationHeight * kObservationWidth;
@@ -376,79 +378,29 @@ void ErenYifangState::WriteObservationFeatures(Player player,
   };
 
   write_plane(hand_[player]);
-  write_plane(self_exposed);
-  write_plane(self_hidden);
+  write_plane(table_counts);
+  write_plane(pile_counts[0]);
+  write_plane(pile_counts[1]);
 
-  const int self_discard_start =
-      std::max(0, static_cast<int>(discard_history_[player].size()) -
-                      kMaxTrackedDiscards);
-  for (int index = 0; index < kMaxTrackedDiscards; ++index) {
-    const int plane_offset = offset + index * plane_size;
-    if (self_discard_start + index <
-        static_cast<int>(discard_history_[player].size())) {
-      WriteSingleTilePlane(
-          discard_history_[player][self_discard_start + index],
-          values.subspan(plane_offset, plane_size));
-    } else {
-      std::fill(values.begin() + plane_offset,
-                values.begin() + plane_offset + plane_size, 0.0f);
-    }
+  for (int seat = 0; seat < kNumPlayers; ++seat) {
+    absl::Span<float> plane = values.subspan(offset, plane_size);
+    std::fill(plane.begin(), plane.end(), seat == player ? 1.0f : 0.0f);
+    offset += plane_size;
   }
-  offset += kMaxTrackedDiscards * plane_size;
 
-  write_plane(opp_exposed);
-  write_plane(opp_hidden);
-
-  const int opp_discard_start =
-      std::max(0, static_cast<int>(discard_history_[opponent].size()) -
-                      kMaxTrackedDiscards);
-  for (int index = 0; index < kMaxTrackedDiscards; ++index) {
-    const int plane_offset = offset + index * plane_size;
-    if (opp_discard_start + index <
-        static_cast<int>(discard_history_[opponent].size())) {
-      WriteSingleTilePlane(
-          discard_history_[opponent][opp_discard_start + index],
-          values.subspan(plane_offset, plane_size));
-    } else {
-      std::fill(values.begin() + plane_offset,
-                values.begin() + plane_offset + plane_size, 0.0f);
-    }
-  }
-  offset += kMaxTrackedDiscards * plane_size;
   SPIEL_CHECK_EQ(offset, kObservationTensorSize);
 }
 
 void ErenYifangState::WriteInformationStateFeatures(
     Player player, absl::Span<float> values) const {
   SPIEL_CHECK_EQ(values.size(), kInformationStateTensorSize);
-  std::fill(values.begin(), values.end(), 0.0f);
-
-  const int opponent = 1 - player;
-  int offset = 0;
-
-  values[offset + player] = 1.0f;
-  offset += kPositionFeatureChannels;
-
-  auto write_last_action_features = [&](int target_player) {
-    const Action last_action = last_actions_by_player_[target_player];
-    if (last_action != kInvalidAction) {
-      values[offset + last_action] = 1.0f;
-    }
-    offset += kNumDistinctActions;
-  };
-
-  write_last_action_features(player);
-  write_last_action_features(opponent);
-  SPIEL_CHECK_EQ(offset, kInformationStateTensorSize);
+  WriteObservationFeatures(player, values);
 }
 
 void ErenYifangState::RecordPublicActionEvent(Action action) {
   SPIEL_CHECK_GE(action, 0);
   SPIEL_CHECK_LT(action, kNumDistinctActions);
   last_action_ = action;
-  if (current_player_ >= 0 && current_player_ < kNumPlayers) {
-    last_actions_by_player_[current_player_] = action;
-  }
 }
 
 void ErenYifangState::ClearDiscardContext() {
@@ -482,9 +434,6 @@ void ErenYifangState::UndoPendingAddGong() {
 
 void ErenYifangState::EnterDrawChance(Player player) {
   current_player_ = player;
-  discard_only_turn_ = false;
-  hu_declined_in_context_ = false;
-  pending_draw_player_ = kInvalidPlayer;
   play_phase_ = PlayPhase::kDrawChance;
   if (!HasWallTiles()) {
     SetDrawOutcome();
@@ -526,45 +475,30 @@ std::string ErenYifangState::ActionToString(Player player, Action action) const 
   if (player == kChancePlayerId) {
     return absl::StrCat(
         phase_ == Phase::kDeal ? "Deal " : "ChanceDraw ",
-        TileTypeToString(wall_[action]));
+        TileTypeToString(wall_[action]), " @", action);
   }
   if (action == kDrawAction) {
     return "Draw";
   }
+  if (action == kPongAction) {
+    return "Pong";
+  }
+  if (action == kGongAction) {
+    return "Gong";
+  }
+  if (action == kStandAction) {
+    return "Stand";
+  }
   if (action == kHuAction) {
     return "Hu";
   }
-  if (action == kPassAction) {
-    return "Pass";
-  }
-  if (action == kPassHuAction) {
-    return "PassHu";
+  if (action == kZimoAction) {
+    return "Zimo";
   }
   if (InActionRange(action, kDiscardActionBase, kDiscardActionEnd)) {
     return absl::StrCat("Discard ",
                         TileTypeToString(TileFromAction(action,
                                                         kDiscardActionBase)));
-  }
-  if (InActionRange(action, kPongActionBase, kPongActionEnd)) {
-    return absl::StrCat("Pong ",
-                        TileTypeToString(TileFromAction(action,
-                                                        kPongActionBase)));
-  }
-  if (InActionRange(action, kGongActionBase, kGongActionEnd)) {
-    return absl::StrCat("Gong ",
-                        TileTypeToString(TileFromAction(action,
-                                                        kGongActionBase)));
-  }
-  if (InActionRange(action, kConcealedGongActionBase,
-                    kConcealedGongActionEnd)) {
-    return absl::StrCat("ConcealedGong ",
-                        TileTypeToString(TileFromAction(
-                            action, kConcealedGongActionBase)));
-  }
-  if (InActionRange(action, kAddGongActionBase, kAddGongActionEnd)) {
-    return absl::StrCat("AddGong ",
-                        TileTypeToString(TileFromAction(action,
-                                                        kAddGongActionBase)));
   }
   return absl::StrCat("Unknown(", action, ")");
 }
@@ -804,23 +738,18 @@ std::vector<Action> ErenYifangState::DealLegalActions() const {
 
 std::vector<Action> ErenYifangState::ActorTurnLegalActions() const {
   std::vector<Action> actions;
-  if (!discard_only_turn_) {
-    if (!hu_declined_in_context_ && CanHu(current_player_)) {
-      actions.push_back(kHuAction);
-      actions.push_back(kPassHuAction);
-    }
+  if (CanHu(current_player_)) {
+    actions.push_back(kZimoAction);
+  }
 
-    for (int tile = 0; tile < kNumTileTypes; ++tile) {
-      if (hand_[current_player_][tile] == 4) {
-        actions.push_back(kConcealedGongActionBase + tile);
-      }
-    }
-
-    for (const Meld& meld : melds_[current_player_]) {
-      if (meld.type == MeldType::kPong &&
-          hand_[current_player_][meld.tile_type] > 0) {
-        actions.push_back(kAddGongActionBase + meld.tile_type);
-      }
+  if (HasWallTiles()) {
+    const bool can_concealed_gong =
+        FirstConcealedGongTile(current_player_) >= 0;
+    const bool can_add_gong =
+        current_player_ != last_player_ &&
+        FirstAddGongTile(current_player_) >= 0;
+    if (can_concealed_gong || can_add_gong) {
+      actions.push_back(kGongAction);
     }
   }
 
@@ -837,17 +766,20 @@ std::vector<Action> ErenYifangState::ActorTurnLegalActions() const {
 
 std::vector<Action> ErenYifangState::RespondToDiscardLegalActions() const {
   std::vector<Action> actions;
-  actions.push_back(kDrawAction);
 
-  if (!hu_declined_in_context_ && CanHuWithTile(current_player_, last_discard_)) {
+  if (CanHuWithTile(current_player_, last_discard_)) {
     actions.push_back(kHuAction);
-    actions.push_back(kPassHuAction);
   }
-  if (hand_[current_player_][last_discard_] >= 2) {
-    actions.push_back(kPongActionBase + last_discard_);
-  }
-  if (hand_[current_player_][last_discard_] >= 3) {
-    actions.push_back(kGongActionBase + last_discard_);
+  if (HasWallTiles()) {
+    if (hand_[current_player_][last_discard_] >= 3) {
+      actions.push_back(kGongAction);
+    }
+    if (hand_[current_player_][last_discard_] >= 2) {
+      actions.push_back(kPongAction);
+    }
+    if (!actions.empty()) {
+      actions.push_back(kDrawAction);
+    }
   }
 
   std::sort(actions.begin(), actions.end());
@@ -857,16 +789,10 @@ std::vector<Action> ErenYifangState::RespondToDiscardLegalActions() const {
 
 std::vector<Action> ErenYifangState::RespondToAddGongLegalActions() const {
   std::vector<Action> actions;
-  if (!hu_declined_in_context_ &&
-      CanHuWithTile(current_player_, pending_kong_tile_)) {
+  if (CanHuWithTile(current_player_, pending_kong_tile_)) {
     actions.push_back(kHuAction);
-    actions.push_back(kPassHuAction);
   }
   return actions;
-}
-
-std::vector<Action> ErenYifangState::AwaitDrawLegalActions() const {
-  return {kDrawAction};
 }
 
 std::vector<Action> ErenYifangState::LegalActions() const {
@@ -881,10 +807,15 @@ std::vector<Action> ErenYifangState::LegalActions() const {
           return RespondToDiscardLegalActions();
         case PlayPhase::kRespondToAddGong:
           return RespondToAddGongLegalActions();
-        case PlayPhase::kAwaitDraw:
-          return AwaitDrawLegalActions();
-        case PlayPhase::kDrawChance:
-          return {};
+        case PlayPhase::kDrawChance: {
+          std::vector<Action> actions;
+          actions.reserve(static_cast<int>(wall_.size()) - wall_pos_);
+          for (int action = wall_pos_; action < static_cast<int>(wall_.size());
+               ++action) {
+            actions.push_back(action);
+          }
+          return actions;
+        }
       }
       break;
     case Phase::kGameOver:
@@ -908,9 +839,6 @@ void ErenYifangState::DoApplyAction(Action action) {
           return;
         case PlayPhase::kRespondToAddGong:
           ApplyRespondToAddGongAction(action);
-          return;
-        case PlayPhase::kAwaitDraw:
-          ApplyAwaitDrawAction(action);
           return;
         case PlayPhase::kDrawChance:
           ApplyDrawChanceAction(action);
@@ -945,8 +873,6 @@ void ErenYifangState::ApplyDealAction(Action action) {
     play_phase_ = PlayPhase::kActorTurn;
     current_player_ = 0;
     wall_pos_ = tiles_dealt_;
-    discard_only_turn_ = false;
-    hu_declined_in_context_ = false;
   }
 }
 
@@ -960,20 +886,12 @@ void ErenYifangState::ApplyDrawChanceAction(Action action) {
   hand_[current_player_][tile]++;
   last_drawn_tile_ = tile;
   play_phase_ = PlayPhase::kActorTurn;
-  discard_only_turn_ = false;
-  hu_declined_in_context_ = false;
 }
 
 void ErenYifangState::ApplyActorTurnAction(Action action) {
   const Player player = current_player_;
 
-  if (action == kPassHuAction) {
-    RecordPublicActionEvent(action);
-    hu_declined_in_context_ = true;
-    return;
-  }
-
-  if (action == kHuAction) {
+  if (action == kZimoAction) {
     RecordPublicActionEvent(action);
     WinContext context;
     context.self_draw = true;
@@ -987,53 +905,51 @@ void ErenYifangState::ApplyActorTurnAction(Action action) {
     return;
   }
 
-  if (InActionRange(action, kConcealedGongActionBase,
-                    kConcealedGongActionEnd)) {
-    const int tile = TileFromAction(action, kConcealedGongActionBase);
-    SPIEL_CHECK_EQ(hand_[player][tile], 4);
+  if (action == kGongAction) {
+    SPIEL_CHECK_TRUE(HasWallTiles());
     RecordPublicActionEvent(action);
     is_first_action_[player] = false;
-    hand_[player][tile] = 0;
-    melds_[player].push_back({MeldType::kConcealedGong, tile});
-    gong_mode_[player][tile] = 0;
+
+    const int add_gong_tile =
+        current_player_ != last_player_ ? FirstAddGongTile(player) : -1;
+    if (add_gong_tile >= 0) {
+      bool upgraded = false;
+      for (Meld& meld : melds_[player]) {
+        if (meld.type == MeldType::kPong && meld.tile_type == add_gong_tile) {
+          meld.type = MeldType::kAddGong;
+          upgraded = true;
+          break;
+        }
+      }
+      SPIEL_CHECK_TRUE(upgraded);
+      --hand_[player][add_gong_tile];
+      gong_mode_[player][add_gong_tile] = 2;
+      pending_add_gong_ = true;
+      pending_kong_player_ = player;
+      pending_kong_tile_ = add_gong_tile;
+      is_gonging_[player] = true;
+      discard_after_gong_[player] = false;
+
+      const Player responder = 1 - player;
+      if (CanHuWithTile(responder, add_gong_tile)) {
+        current_player_ = responder;
+        play_phase_ = PlayPhase::kRespondToAddGong;
+      } else {
+        ClearPendingAddGong();
+        EnterDrawChance(player);
+      }
+      return;
+    }
+
+    const int concealed_gong_tile = FirstConcealedGongTile(player);
+    SPIEL_CHECK_GE(concealed_gong_tile, 0);
+    hand_[player][concealed_gong_tile] = 0;
+    melds_[player].push_back(
+        {MeldType::kConcealedGong, concealed_gong_tile});
+    gong_mode_[player][concealed_gong_tile] = 0;
     is_gonging_[player] = true;
     discard_after_gong_[player] = false;
     EnterDrawChance(player);
-    return;
-  }
-
-  if (InActionRange(action, kAddGongActionBase, kAddGongActionEnd)) {
-    const int tile = TileFromAction(action, kAddGongActionBase);
-    SPIEL_CHECK_GT(hand_[player][tile], 0);
-    bool upgraded = false;
-    for (Meld& meld : melds_[player]) {
-      if (meld.type == MeldType::kPong && meld.tile_type == tile) {
-        meld.type = MeldType::kAddGong;
-        upgraded = true;
-        break;
-      }
-    }
-    SPIEL_CHECK_TRUE(upgraded);
-
-    RecordPublicActionEvent(action);
-    is_first_action_[player] = false;
-    --hand_[player][tile];
-    gong_mode_[player][tile] = 2;
-    pending_add_gong_ = true;
-    pending_kong_player_ = player;
-    pending_kong_tile_ = tile;
-    is_gonging_[player] = true;
-    discard_after_gong_[player] = false;
-
-    const Player responder = 1 - player;
-    if (CanHuWithTile(responder, tile)) {
-      current_player_ = responder;
-      play_phase_ = PlayPhase::kRespondToAddGong;
-      hu_declined_in_context_ = false;
-    } else {
-      ClearPendingAddGong();
-      EnterDrawChance(player);
-    }
     return;
   }
 
@@ -1046,19 +962,24 @@ void ErenYifangState::ApplyActorTurnAction(Action action) {
   is_first_action_[player] = false;
   --hand_[player][tile];
   discard_history_[player].push_back(tile);
+  table_.push_back(tile);
   last_discard_ = tile;
   last_discard_player_ = player;
+  last_player_ = player;
   discard_after_gong_[player] = is_gonging_[player];
   is_gonging_[player] = false;
-  discard_only_turn_ = false;
-  hu_declined_in_context_ = false;
 
   const Player responder = 1 - player;
-  if (CanHuWithTile(responder, tile) || hand_[responder][tile] >= 2) {
+  const bool can_respond =
+      CanHuWithTile(responder, tile) ||
+      (HasWallTiles() && hand_[responder][tile] >= 2);
+  if (can_respond) {
     current_player_ = responder;
     play_phase_ = PlayPhase::kRespondToDiscard;
-  } else {
+  } else if (HasWallTiles()) {
     EnterDrawChance(responder);
+  } else {
+    SetDrawOutcome();
   }
 }
 
@@ -1066,17 +987,8 @@ void ErenYifangState::ApplyRespondToDiscardAction(Action action) {
   const Player responder = current_player_;
   SPIEL_CHECK_GE(last_discard_, 0);
 
-  if (action == kPassHuAction) {
-    RecordPublicActionEvent(action);
-    hu_declined_in_context_ = true;
-    if (hand_[responder][last_discard_] < 2) {
-      ClearDiscardContext();
-      EnterDrawChance(responder);
-    }
-    return;
-  }
-
   if (action == kDrawAction) {
+    SPIEL_CHECK_TRUE(HasWallTiles());
     RecordPublicActionEvent(action);
     ClearDiscardContext();
     EnterDrawChance(responder);
@@ -1085,6 +997,9 @@ void ErenYifangState::ApplyRespondToDiscardAction(Action action) {
 
   if (action == kHuAction) {
     RecordPublicActionEvent(action);
+    SPIEL_CHECK_FALSE(table_.empty());
+    SPIEL_CHECK_EQ(table_.back(), last_discard_);
+    table_.pop_back();
     ++hand_[responder][last_discard_];
     WinContext context;
     context.self_draw = false;
@@ -1098,31 +1013,35 @@ void ErenYifangState::ApplyRespondToDiscardAction(Action action) {
     return;
   }
 
-  if (InActionRange(action, kPongActionBase, kPongActionEnd)) {
-    const int tile = TileFromAction(action, kPongActionBase);
-    SPIEL_CHECK_EQ(tile, last_discard_);
+  if (action == kPongAction) {
+    const int tile = last_discard_;
     SPIEL_CHECK_GE(hand_[responder][tile], 2);
     RecordPublicActionEvent(action);
     is_first_action_[responder] = false;
     hand_[responder][tile] -= 2;
     melds_[responder].push_back({MeldType::kPong, tile});
+    SPIEL_CHECK_FALSE(table_.empty());
+    SPIEL_CHECK_EQ(table_.back(), tile);
+    table_.pop_back();
     ClearDiscardContext();
+    last_player_ = responder;
     current_player_ = responder;
     play_phase_ = PlayPhase::kActorTurn;
-    discard_only_turn_ = true;
-    hu_declined_in_context_ = false;
     return;
   }
 
-  SPIEL_CHECK_TRUE(InActionRange(action, kGongActionBase, kGongActionEnd));
-  const int tile = TileFromAction(action, kGongActionBase);
-  SPIEL_CHECK_EQ(tile, last_discard_);
+  SPIEL_CHECK_EQ(action, kGongAction);
+  SPIEL_CHECK_TRUE(HasWallTiles());
+  const int tile = last_discard_;
   SPIEL_CHECK_GE(hand_[responder][tile], 3);
   RecordPublicActionEvent(action);
   is_first_action_[responder] = false;
   hand_[responder][tile] -= 3;
   melds_[responder].push_back({MeldType::kDirectGong, tile});
   gong_mode_[responder][tile] = 1;
+  SPIEL_CHECK_FALSE(table_.empty());
+  SPIEL_CHECK_EQ(table_.back(), tile);
+  table_.pop_back();
   ClearDiscardContext();
   is_gonging_[responder] = true;
   discard_after_gong_[responder] = false;
@@ -1149,33 +1068,15 @@ void ErenYifangState::ApplyRespondToAddGongAction(Action action) {
     return;
   }
 
-  SPIEL_CHECK_EQ(action, kPassHuAction);
-  RecordPublicActionEvent(action);
-  const Player kong_player = pending_kong_player_;
-  ClearPendingAddGong();
-  current_player_ = kong_player;
-  pending_draw_player_ = kong_player;
-  discard_only_turn_ = false;
-  hu_declined_in_context_ = false;
-  play_phase_ = PlayPhase::kAwaitDraw;
-}
-
-void ErenYifangState::ApplyAwaitDrawAction(Action action) {
-  SPIEL_CHECK_EQ(action, kDrawAction);
-  RecordPublicActionEvent(action);
-  pending_draw_player_ = kInvalidPlayer;
-  if (!HasWallTiles()) {
-    SetDrawOutcome();
-    return;
-  }
-  play_phase_ = PlayPhase::kDrawChance;
+  SpielFatalError(
+      "RLCard mahjong_two_by_one only exposes Hu when robbing a gong.");
 }
 
 ErenYifangGame::ErenYifangGame(const GameParameters& params)
     : Game(kGameType, params) {}
 
 std::vector<int> ErenYifangGame::InformationStateTensorShape() const {
-  return {kInformationStateTensorSize};
+  return {kObservationChannels, kObservationHeight, kObservationWidth};
 }
 
 std::vector<int> ErenYifangGame::ObservationTensorShape() const {

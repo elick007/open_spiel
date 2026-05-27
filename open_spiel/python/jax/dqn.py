@@ -13,7 +13,7 @@
 # limitations under the License.
 """DQN agent implemented in JAX."""
 
-import enum
+from backports.strenum import StrEnum
 import functools
 from typing import Any, Callable, Iterable, NamedTuple
 
@@ -191,18 +191,18 @@ def forward(model, x: chex.Array) -> chex.Array:
   return model(x)
 
 
-class Loss(enum.StrEnum):
+class Loss(StrEnum):
   MSE = "mse"
   HUBER = "huber"
 
 
-class Optimiser(enum.StrEnum):
+class Optimiser(StrEnum):
   SGD = "sgd"
   RMSPROP = "rmsprop"
   ADAM = "adam"
 
 
-class EpsilonDecaySchedule(enum.StrEnum):
+class EpsilonDecaySchedule(StrEnum):
   LINEAR = "linear"
   EXP = "exp"
 
@@ -388,7 +388,7 @@ class DQN(rl_agent.AbstractAgent):
 
     @jax.jit
     def infer(state: nn.State, info_state: chex.Array) -> chex.Array:
-      model = nn.merge(self._graphdef_q_network, state, copy=True)
+      model = nn.merge(self._graphdef_q_network, state)
       q_values = model(info_state)
       return q_values
 
@@ -433,7 +433,7 @@ class DQN(rl_agent.AbstractAgent):
         batch: Transition,
     ) -> tuple[chex.Numeric, nn.State]:
       q_network, optimiser = nn.merge(
-          self._graphdef_q_network_opt, q_network_opt_state, copy=True
+          self._graphdef_q_network_opt, q_network_opt_state
       )
       target_q_network = nn.merge(
           self._graphdef_target_q_network, target_q_network_state
@@ -450,7 +450,7 @@ class DQN(rl_agent.AbstractAgent):
           batch.legal_actions_mask,
       )
 
-      optimiser.update(q_network, grads)
+      optimiser.update(grads)
 
       return main_loss, nn.state((q_network, optimiser))
 

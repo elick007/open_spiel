@@ -37,36 +37,29 @@ inline constexpr int kNonDealerInitialHandSize = 7;
 inline constexpr int kInitialDealCount =
     kDealerInitialHandSize + kNonDealerInitialHandSize;
 
-inline constexpr int kDrawAction = 0;
-inline constexpr int kHuAction = 1;
-inline constexpr int kPassAction = 2;
-inline constexpr int kDiscardActionBase = 3;
+// RLCard `mahjong_two_by_one` action ids:
+//   0..8: discard tile 1..9, 9: draw/pass, 10: pong, 11: gong,
+//   12: stand (defined by RLCard but not used by its round logic),
+//   13: hu, 14: zimo.
+inline constexpr int kDiscardActionBase = 0;
 inline constexpr int kDiscardActionEnd = kDiscardActionBase + kNumTileTypes - 1;
-inline constexpr int kPongActionBase = kDiscardActionEnd + 1;
-inline constexpr int kPongActionEnd = kPongActionBase + kNumTileTypes - 1;
-inline constexpr int kGongActionBase = kPongActionEnd + 1;
-inline constexpr int kGongActionEnd = kGongActionBase + kNumTileTypes - 1;
-inline constexpr int kConcealedGongActionBase = kGongActionEnd + 1;
-inline constexpr int kConcealedGongActionEnd =
-    kConcealedGongActionBase + kNumTileTypes - 1;
-inline constexpr int kPassHuAction = kConcealedGongActionEnd + 1;
-inline constexpr int kAddGongActionBase = kPassHuAction + 1;
-inline constexpr int kAddGongActionEnd =
-    kAddGongActionBase + kNumTileTypes - 1;
-inline constexpr int kNumDistinctActions = kAddGongActionEnd + 1;
+inline constexpr int kDrawAction = kNumTileTypes;
+inline constexpr int kPongAction = kDrawAction + 1;
+inline constexpr int kGongAction = kPongAction + 1;
+inline constexpr int kStandAction = kGongAction + 1;
+inline constexpr int kHuAction = kStandAction + 1;
+inline constexpr int kZimoAction = kHuAction + 1;
+inline constexpr int kNumDistinctActions = kZimoAction + 1;
 
-inline constexpr int kImageObservationChannels = 31;
-inline constexpr int kPositionFeatureChannels = kNumPlayers;
-inline constexpr int kLastActionFeatureChannels = kNumPlayers * kNumDistinctActions;
-inline constexpr int kAuxObservationChannels =
-    kPositionFeatureChannels + kLastActionFeatureChannels;
-inline constexpr int kObservationChannels = kImageObservationChannels;
-inline constexpr int kObservationHeight = 4;
-inline constexpr int kObservationWidth = kNumTileTypes;
-inline constexpr int kMaxTrackedDiscards = 13;
+inline constexpr int kBaseObservationChannels = 4;
+inline constexpr int kPositionObservationChannels = kNumPlayers;
+inline constexpr int kObservationChannels =
+    kBaseObservationChannels + kPositionObservationChannels;
+inline constexpr int kObservationHeight = kNumTileTypes;
+inline constexpr int kObservationWidth = kTilesPerKind;
 inline constexpr int kObservationTensorSize =
     kObservationChannels * kObservationHeight * kObservationWidth;
-inline constexpr int kInformationStateTensorSize = kAuxObservationChannels;
+inline constexpr int kInformationStateTensorSize = kObservationTensorSize;
 
 enum class Phase {
   kDeal,
@@ -78,7 +71,6 @@ enum class PlayPhase {
   kActorTurn,
   kRespondToDiscard,
   kRespondToAddGong,
-  kAwaitDraw,
   kDrawChance,
 };
 
@@ -136,6 +128,7 @@ class ErenYifangState : public State {
   std::array<std::array<int, kNumTileTypes>, kNumPlayers> hand_{};
   std::array<std::vector<Meld>, kNumPlayers> melds_{};
   std::array<std::vector<int>, kNumPlayers> discard_history_{};
+  std::vector<int> table_;
   std::array<std::array<int, kNumTileTypes>, kNumPlayers> gong_mode_{};
   std::vector<int> wall_;
   int wall_pos_ = 0;
@@ -145,25 +138,21 @@ class ErenYifangState : public State {
   Player current_player_ = kChancePlayerId;
   int tiles_dealt_ = 0;
 
-  bool discard_only_turn_ = false;
-  bool hu_declined_in_context_ = false;
   int last_drawn_tile_ = -1;
 
   int last_discard_ = -1;
   Player last_discard_player_ = kInvalidPlayer;
+  Player last_player_ = kInvalidPlayer;
 
   bool pending_add_gong_ = false;
   Player pending_kong_player_ = kInvalidPlayer;
   int pending_kong_tile_ = -1;
-  Player pending_draw_player_ = kInvalidPlayer;
 
   std::array<bool, kNumPlayers> is_first_action_{true, true};
   std::array<bool, kNumPlayers> is_gonging_{};
   std::array<bool, kNumPlayers> discard_after_gong_{};
 
   Action last_action_ = kInvalidAction;
-  std::array<Action, kNumPlayers> last_actions_by_player_{
-      {kInvalidAction, kInvalidAction}};
   std::vector<double> returns_ = std::vector<double>(kNumPlayers, 0.0);
 
   std::string TileTypeToString(int tile_type) const;
@@ -184,6 +173,8 @@ class ErenYifangState : public State {
   int BaseFan(int player) const;
   int BonusFan(int player, const WinContext& context) const;
   int KongScore(int player) const;
+  int FirstConcealedGongTile(int player) const;
+  int FirstAddGongTile(int player) const;
 
   void WriteObservationFeatures(Player player, absl::Span<float> values) const;
   void WriteInformationStateFeatures(Player player,
@@ -200,14 +191,12 @@ class ErenYifangState : public State {
   std::vector<Action> ActorTurnLegalActions() const;
   std::vector<Action> RespondToDiscardLegalActions() const;
   std::vector<Action> RespondToAddGongLegalActions() const;
-  std::vector<Action> AwaitDrawLegalActions() const;
 
   void ApplyDealAction(Action action);
   void ApplyDrawChanceAction(Action action);
   void ApplyActorTurnAction(Action action);
   void ApplyRespondToDiscardAction(Action action);
   void ApplyRespondToAddGongAction(Action action);
-  void ApplyAwaitDrawAction(Action action);
 };
 
 class ErenYifangGame : public Game {

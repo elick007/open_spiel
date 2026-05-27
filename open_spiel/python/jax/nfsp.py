@@ -25,6 +25,7 @@ import enum
 import functools
 from typing import Iterable, NamedTuple
 
+from backports.strenum import StrEnum
 import chex
 import etils.epath
 import flax.nnx as nn
@@ -49,7 +50,7 @@ class MODE(enum.Enum):
   AVERAGE_POLICY = 1
 
 
-class Optimiser(enum.StrEnum):
+class Optimiser(StrEnum):
   SGD = "sgd"
   RMSPROP = "rmsprop"
   ADAM = "adam"
@@ -307,7 +308,7 @@ class NFSP(rl_agent.AbstractAgent):
           batch.legal_actions_mask,
           batch.action_probs,
       )
-      optimiser.update(avg_network, grads)
+      optimiser.update(grads)
 
       return main_loss, nn.state((avg_network, optimiser))
 
