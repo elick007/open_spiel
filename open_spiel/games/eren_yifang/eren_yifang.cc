@@ -32,6 +32,8 @@ namespace open_spiel {
 namespace eren_yifang {
 namespace {
 
+inline constexpr int kDrawTenpaiPenalty = 2;
+
 const GameType kGameType{
     /*short_name=*/"eren_yifang",
     /*long_name=*/"Er Ren Yi Fang",
@@ -201,6 +203,22 @@ bool ErenYifangState::CanHuWithTile(int player, int tile_type) const {
                        static_cast<int>(melds_[player].size()));
 }
 
+bool ErenYifangState::IsTenpai(int player) const {
+  if (CountConcealedTiles(player) % 3 != 1) {
+    return false;
+  }
+
+  for (int tile = 0; tile < kNumTileTypes; ++tile) {
+    if (CountPhysicalTiles(player, tile) >= kTilesPerKind) {
+      continue;
+    }
+    if (CanHuWithTile(player, tile)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool ErenYifangState::IsDuiDuiHu(int player) const {
   for (int tile = 0; tile < kNumTileTypes; ++tile) {
     if (hand_[player][tile] > 0 && hand_[player][tile] < 2) {
@@ -324,9 +342,15 @@ int ErenYifangState::BonusFan(int player, const WinContext& context) const {
   return fan;
 }
 
-int ErenYifangState::KongScore(int player) const {
+int ErenYifangState::KongScore(int player, int excluded_tile) const {
   int score = 0;
+  bool skipped_excluded = false;
   for (const Meld& meld : melds_[player]) {
+    if (!skipped_excluded && meld.tile_type == excluded_tile &&
+        meld.type != MeldType::kPong) {
+      skipped_excluded = true;
+      continue;
+    }
     switch (meld.type) {
       case MeldType::kPong:
         break;
@@ -492,8 +516,17 @@ void ErenYifangState::EnterDrawChance(Player player) {
 }
 
 void ErenYifangState::SetDrawOutcome() {
-  returns_[0] = 0.0;
-  returns_[1] = 0.0;
+  const bool player0_tenpai = IsTenpai(0);
+  const bool player1_tenpai = IsTenpai(1);
+  if (player0_tenpai != player1_tenpai) {
+    const int winner = player0_tenpai ? 0 : 1;
+    const int loser = 1 - winner;
+    returns_[winner] = kDrawTenpaiPenalty;
+    returns_[loser] = -kDrawTenpaiPenalty;
+  } else {
+    returns_[0] = 0.0;
+    returns_[1] = 0.0;
+  }
   phase_ = Phase::kGameOver;
 }
 
@@ -503,7 +536,9 @@ void ErenYifangState::ScoreUp(int winner, const WinContext& context) {
       std::min(BaseFan(winner) + BonusFan(winner, context), 4);
   const double base_score = std::ldexp(1.0, total_fan);
   const double winner_score = base_score + KongScore(winner);
-  const double loser_score = KongScore(loser);
+  const int excluded_loser_kong_tile =
+      context.gang_shang_pao ? last_kong_tile_[loser] : -1;
+  const double loser_score = KongScore(loser, excluded_loser_kong_tile);
   const double score = std::abs(winner_score - loser_score);
 
   returns_[winner] = score;
@@ -997,6 +1032,7 @@ void ErenYifangState::ApplyActorTurnAction(Action action) {
     melds_[player].push_back({MeldType::kConcealedGong, tile});
     gong_mode_[player][tile] = 0;
     is_gonging_[player] = true;
+    last_kong_tile_[player] = tile;
     discard_after_gong_[player] = false;
     EnterDrawChance(player);
     return;
@@ -1023,6 +1059,7 @@ void ErenYifangState::ApplyActorTurnAction(Action action) {
     pending_kong_player_ = player;
     pending_kong_tile_ = tile;
     is_gonging_[player] = true;
+    last_kong_tile_[player] = tile;
     discard_after_gong_[player] = false;
 
     const Player responder = 1 - player;
@@ -1125,6 +1162,7 @@ void ErenYifangState::ApplyRespondToDiscardAction(Action action) {
   gong_mode_[responder][tile] = 1;
   ClearDiscardContext();
   is_gonging_[responder] = true;
+  last_kong_tile_[responder] = tile;
   discard_after_gong_[responder] = false;
   EnterDrawChance(responder);
 }

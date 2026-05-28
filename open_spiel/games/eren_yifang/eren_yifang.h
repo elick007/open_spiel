@@ -160,6 +160,7 @@ class ErenYifangState : public State {
   std::array<bool, kNumPlayers> is_first_action_{true, true};
   std::array<bool, kNumPlayers> is_gonging_{};
   std::array<bool, kNumPlayers> discard_after_gong_{};
+  std::array<int, kNumPlayers> last_kong_tile_{{-1, -1}};
 
   Action last_action_ = kInvalidAction;
   std::array<Action, kNumPlayers> last_actions_by_player_{
@@ -173,6 +174,7 @@ class ErenYifangState : public State {
 
   bool CanHu(int player) const;
   bool CanHuWithTile(int player, int tile_type) const;
+  bool IsTenpai(int player) const;
   bool IsWinningHand(const std::array<int, kNumTileTypes>& hand,
                      int meld_count) const;
   bool IsDuiDuiHu(int player) const;
@@ -183,7 +185,7 @@ class ErenYifangState : public State {
   int CountRoots(int player) const;
   int BaseFan(int player) const;
   int BonusFan(int player, const WinContext& context) const;
-  int KongScore(int player) const;
+  int KongScore(int player, int excluded_tile = -1) const;
 
   void WriteObservationFeatures(Player player, absl::Span<float> values) const;
   void WriteInformationStateFeatures(Player player,

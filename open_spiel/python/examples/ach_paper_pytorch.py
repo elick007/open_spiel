@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import multiprocessing as mp
@@ -62,6 +63,7 @@ PAPER_MAHJONG_LOGIT_THRESHOLD = 6.0
 PAPER_MAHJONG_ENTROPY_COEF = 1e-2
 PAPER_MAHJONG_VALUE_COEF = 0.5
 PAPER_MAHJONG_ETA = 1.0
+PAPER_MAHJONG_MIN_BEHAVIOR_PROB = 1e-2
 
 
 def module_init(module: nn.Module,
@@ -208,6 +210,7 @@ class BatchTransition:
   old_prob: float
   advantage: float
   return_: float
+  policy_version: int = 0
 
 
 class TransitionReplayBuffer:
@@ -221,13 +224,28 @@ class TransitionReplayBuffer:
   def __len__(self) -> int:
     return len(self._storage)
 
-  def add(self, transitions: Sequence[BatchTransition]) -> None:
+  def add(self,
+          transitions: Sequence[BatchTransition],
+          policy_version: Optional[int] = None) -> None:
     if not transitions:
       return
+    if policy_version is not None:
+      for transition in transitions:
+        transition.policy_version = int(policy_version)
     self._storage.extend(transitions)
     overflow = len(self._storage) - self.capacity
     if overflow > 0:
       del self._storage[:overflow]
+
+  def drop_older_than(self, min_policy_version: int) -> int:
+    if min_policy_version <= 0:
+      return 0
+    original_size = len(self._storage)
+    self._storage = [
+        transition for transition in self._storage
+        if transition.policy_version >= min_policy_version
+    ]
+    return original_size - len(self._storage)
 
   def can_sample(self, batch_size: int) -> bool:
     return len(self._storage) >= batch_size
@@ -244,12 +262,21 @@ class TransitionReplayBuffer:
     return [self._storage[int(index)] for index in indices]
 
 
-def _cpu_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-  """Returns a detached CPU snapshot that is safe to ship to worker processes."""
+def _cpu_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, np.ndarray]:
+  """Returns a detached CPU snapshot that is safe to pickle for actors."""
   return {
-      key: value.detach().cpu().clone()
+      key: value.detach().cpu().numpy().copy()
       for key, value in state_dict.items()
   }
+
+
+def _load_cpu_state_dict(module: nn.Module,
+                         state_dict: Dict[str, np.ndarray]) -> None:
+  """Loads a NumPy-backed CPU state dict into a torch module."""
+  module.load_state_dict({
+      key: torch.as_tensor(value)
+      for key, value in state_dict.items()
+  })
 
 
 def _split_sample_count(total_samples: int, num_workers: int) -> List[int]:
@@ -289,6 +316,15 @@ def _configure_torch_multiprocessing() -> None:
     torch.multiprocessing.set_sharing_strategy("file_system")
   except (AttributeError, RuntimeError):
     pass
+
+
+def _cosine_decay(initial_value: float, step: int, max_step: int) -> float:
+  """Cosine-decays a positive scalar from its initial value to zero."""
+  if max_step <= 0:
+    return float(initial_value)
+  clipped_step = min(max(int(step), 0), int(max_step))
+  cosine = 0.5 * (1.0 + math.cos(math.pi * clipped_step / float(max_step)))
+  return float(initial_value) * cosine
 
 
 def _actor_agent_config(agent: "PracticalACHAgent") -> Dict[str, object]:
@@ -493,7 +529,7 @@ class PracticalACHAgent:
       input_shape: Optional[Sequence[int]] = None,
       state_size: Optional[int] = None,
       aux_feature_channels: int = 0,
-      conv_channels: Sequence[int] = (64, 128, 32),
+      conv_channels: Sequence[int] = (32, 64, 128),
       residual_blocks_per_stage: int = 3,
       shared_feature_size: int = 1024,
       head_hidden_sizes: Sequence[int] = (512, 512),
@@ -505,10 +541,13 @@ class PracticalACHAgent:
       entropy_coef: float = PAPER_MAHJONG_ENTROPY_COEF,
       value_coef: float = PAPER_MAHJONG_VALUE_COEF,
       eta: float = PAPER_MAHJONG_ETA,
+      min_behavior_prob: float = PAPER_MAHJONG_MIN_BEHAVIOR_PROB,
       max_grad_norm: float = 0.5,
       update_epochs: int = 1,
       num_minibatches: int = 1,
       normalize_advantages: bool = False,
+      lr_decay: bool = True,
+      clip_decay: bool = True,
       device: Optional[str] = None,
   ):
     if input_shape is None:
@@ -524,18 +563,23 @@ class PracticalACHAgent:
     self.residual_blocks_per_stage = int(residual_blocks_per_stage)
     self.shared_feature_size = int(shared_feature_size)
     self.head_hidden_sizes = tuple(int(size) for size in head_hidden_sizes)
-    self.learning_rate = learning_rate
+    self.learning_rate = float(learning_rate)
+    self.current_learning_rate = float(learning_rate)
     self.gamma = gamma
     self.gae_lambda = gae_lambda
-    self.clip_ratio = clip_ratio
+    self.clip_ratio = float(clip_ratio)
+    self.current_clip_ratio = float(clip_ratio)
     self.logit_threshold = logit_threshold
     self.entropy_coef = entropy_coef
     self.value_coef = value_coef
     self.eta = eta
+    self.min_behavior_prob = min_behavior_prob
     self.max_grad_norm = max_grad_norm
     self.update_epochs = update_epochs
     self.num_minibatches = num_minibatches
     self.normalize_advantages = normalize_advantages
+    self.lr_decay = lr_decay
+    self.clip_decay = clip_decay
     self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     self.network = SharedActorCritic(
@@ -548,7 +592,7 @@ class PracticalACHAgent:
         head_hidden_sizes=self.head_hidden_sizes).to(self.device)
     self.optimizer = optim.Adam(
         self.network.parameters(),
-        lr=learning_rate,
+        lr=self.current_learning_rate,
         eps=1e-5)
 
   def export_config(self) -> Dict[str, object]:
@@ -569,10 +613,13 @@ class PracticalACHAgent:
         "entropy_coef": self.entropy_coef,
         "value_coef": self.value_coef,
         "eta": self.eta,
+        "min_behavior_prob": self.min_behavior_prob,
         "max_grad_norm": self.max_grad_norm,
         "update_epochs": self.update_epochs,
         "num_minibatches": self.num_minibatches,
         "normalize_advantages": self.normalize_advantages,
+        "lr_decay": self.lr_decay,
+        "clip_decay": self.clip_decay,
     }
 
   def _validate_checkpoint_config(self,
@@ -609,6 +656,22 @@ class PracticalACHAgent:
   def _to_tensor(self, array: np.ndarray,
                  dtype=torch.float32) -> torch.Tensor:
     return torch.as_tensor(array, dtype=dtype, device=self.device)
+
+  def set_training_progress(self, iteration: int, total_iterations: int) -> None:
+    """Updates scheduled learner hyperparameters for one training iteration."""
+    if self.lr_decay:
+      self.current_learning_rate = _cosine_decay(
+          self.learning_rate, iteration, total_iterations)
+    else:
+      self.current_learning_rate = self.learning_rate
+    if self.clip_decay:
+      self.current_clip_ratio = _cosine_decay(
+          self.clip_ratio, iteration, total_iterations)
+    else:
+      self.current_clip_ratio = self.clip_ratio
+
+    for param_group in self.optimizer.param_groups:
+      param_group["lr"] = self.current_learning_rate
 
   def _policy_and_value(
       self,
@@ -813,6 +876,9 @@ class PracticalACHAgent:
           "policy_loss": 0.0,
           "value_loss": 0.0,
           "entropy_term": 0.0,
+          "clip_fraction": 0.0,
+          "learning_rate": self.current_learning_rate,
+          "clip_ratio": self.current_clip_ratio,
       }
 
     self.network.train()
@@ -833,12 +899,21 @@ class PracticalACHAgent:
         np.asarray([t.advantage for t in transitions], dtype=np.float32))
     returns = self._to_tensor(
         np.asarray([t.return_ for t in transitions], dtype=np.float32))
+    old_values = returns - advantages
+    policy_advantages = advantages
+    if self.normalize_advantages and len(policy_advantages) > 1:
+      policy_advantages = (
+          (policy_advantages - policy_advantages.mean()) /
+          (policy_advantages.std() + 1e-8))
 
     metrics = {
         "loss": 0.0,
         "policy_loss": 0.0,
         "value_loss": 0.0,
         "entropy_term": 0.0,
+        "clip_fraction": 0.0,
+        "learning_rate": self.current_learning_rate,
+        "clip_ratio": self.current_clip_ratio,
     }
     num_updates = 0
 
@@ -851,12 +926,11 @@ class PracticalACHAgent:
         mb_masks = legal_masks[minibatch_indices]
         mb_actions = actions[minibatch_indices]
         mb_old_probs = old_probs[minibatch_indices].clamp_min(1e-8)
-        mb_advantages = advantages[minibatch_indices]
+        mb_behavior_probs = old_probs[minibatch_indices].clamp_min(
+            self.min_behavior_prob)
+        mb_advantages = policy_advantages[minibatch_indices]
         mb_returns = returns[minibatch_indices]
-
-        if self.normalize_advantages and len(mb_advantages) > 1:
-          mb_advantages = ((mb_advantages - mb_advantages.mean()) /
-                           (mb_advantages.std() + 1e-8))
+        mb_old_values = old_values[minibatch_indices]
 
         logits, policy_probs, values = self._policy_and_value(
             mb_states, mb_auxiliary_features, mb_masks)
@@ -871,17 +945,24 @@ class PracticalACHAgent:
 
         ratio = chosen_probs / mb_old_probs
         positive_adv = mb_advantages >= 0
-        positive_gate = ((ratio < (1.0 + self.clip_ratio)) &
+        positive_gate = ((ratio < (1.0 + self.current_clip_ratio)) &
                          (centered_logits < self.logit_threshold))
-        negative_gate = ((ratio > (1.0 - self.clip_ratio)) &
+        negative_gate = ((ratio > (1.0 - self.current_clip_ratio)) &
                          (centered_logits > -self.logit_threshold))
         gate = torch.where(positive_adv, positive_gate, negative_gate).float()
 
         policy_loss = (
             -self.eta * gate * clipped_centered_logits * mb_advantages /
-            mb_old_probs).mean()
+            mb_behavior_probs).mean()
 
-        value_loss = 0.5 * F.mse_loss(values, mb_returns)
+        clipped_values = mb_old_values + torch.clamp(
+            values - mb_old_values,
+            -self.current_clip_ratio,
+            self.current_clip_ratio)
+        value_loss_unclipped = torch.square(values - mb_returns)
+        value_loss_clipped = torch.square(clipped_values - mb_returns)
+        value_loss = 0.5 * torch.maximum(
+            value_loss_unclipped, value_loss_clipped).mean()
         entropy_term = (
             policy_probs * torch.log(policy_probs.clamp_min(1e-8))).sum(dim=-1).mean()
         total_loss = (
@@ -898,9 +979,12 @@ class PracticalACHAgent:
         metrics["policy_loss"] += float(policy_loss.item())
         metrics["value_loss"] += float(value_loss.item())
         metrics["entropy_term"] += float(entropy_term.item())
+        metrics["clip_fraction"] += float((1.0 - gate).mean().item())
         num_updates += 1
 
-    for key in metrics:
+    averaged_keys = ("loss", "policy_loss", "value_loss", "entropy_term",
+                     "clip_fraction")
+    for key in averaged_keys:
       metrics[key] /= max(num_updates, 1)
     return metrics
 
@@ -978,11 +1062,12 @@ def _collect_batch_worker(worker_args) -> List[BatchTransition]:
 
   game = pyspiel.load_game(game_name)
   worker_agent = _build_rollout_agent(agent_config)
-  worker_agent.network.load_state_dict(network_state)
+  _load_cpu_state_dict(worker_agent.network, network_state)
   return worker_agent.collect_batch(game, min_samples=min_samples)
 
 
-def _drain_latest_network_state(weights_queue) -> Optional[Dict[str, torch.Tensor]]:
+def _drain_latest_network_state(
+    weights_queue) -> Optional[Tuple[int, Dict[str, np.ndarray]]]:
   """Returns the newest queued actor weights, dropping stale snapshots."""
   latest_state = None
   while True:
@@ -993,8 +1078,10 @@ def _drain_latest_network_state(weights_queue) -> Optional[Dict[str, torch.Tenso
 
 
 def _put_latest_network_state(weights_queue,
-                              network_state: Dict[str, torch.Tensor]) -> None:
+                              policy_version: int,
+                              network_state: Dict[str, np.ndarray]) -> None:
   """Queues a fresh weight snapshot, replacing any older unconsumed snapshot."""
+  payload = (int(policy_version), network_state)
   while True:
     try:
       weights_queue.get_nowait()
@@ -1002,14 +1089,14 @@ def _put_latest_network_state(weights_queue,
       break
 
   try:
-    weights_queue.put_nowait(network_state)
+    weights_queue.put_nowait(payload)
   except queue.Full:
     try:
       weights_queue.get_nowait()
     except queue.Empty:
       pass
     try:
-      weights_queue.put(network_state, timeout=0.1)
+      weights_queue.put(payload, timeout=0.1)
     except queue.Full:
       pass
 
@@ -1027,7 +1114,7 @@ def _put_actor_result(result_queue, stop_event, result) -> None:
 def _async_actor_worker(worker_args) -> None:
   """Runs a persistent self-play actor that streams batches to the learner."""
   (actor_id, game_name, chunk_size, worker_seed, agent_config, network_state,
-   result_queue, weights_queue, stop_event) = worker_args
+   initial_policy_version, result_queue, weights_queue, stop_event) = worker_args
 
   try:
     if worker_seed is not None:
@@ -1037,15 +1124,22 @@ def _async_actor_worker(worker_args) -> None:
 
     game = pyspiel.load_game(game_name)
     worker_agent = _build_rollout_agent(agent_config)
-    worker_agent.network.load_state_dict(network_state)
+    _load_cpu_state_dict(worker_agent.network, network_state)
+    policy_version = int(initial_policy_version)
 
     while not stop_event.is_set():
-      latest_state = _drain_latest_network_state(weights_queue)
-      if latest_state is not None:
-        worker_agent.network.load_state_dict(latest_state)
+      latest_payload = _drain_latest_network_state(weights_queue)
+      if latest_payload is not None:
+        policy_version, latest_state = latest_payload
+        _load_cpu_state_dict(worker_agent.network, latest_state)
 
       batch = worker_agent.collect_batch(game, min_samples=chunk_size)
-      _put_actor_result(result_queue, stop_event, ("batch", actor_id, batch))
+      for transition in batch:
+        transition.policy_version = policy_version
+      _put_actor_result(
+          result_queue,
+          stop_event,
+          ("batch", actor_id, policy_version, batch))
   except Exception:  # pylint: disable=broad-except
     _put_actor_result(
         result_queue,
@@ -1063,12 +1157,14 @@ class AsyncActorPool:
                chunk_size: int,
                seed: Optional[int] = None,
                mp_start_method: Optional[str] = None,
-               queue_capacity: int = 2):
+               queue_capacity: int = 2,
+               initial_policy_version: int = 0):
     self.game_name = game_name
     self.agent = agent
     self.num_actors = max(1, int(num_actors))
     self.chunk_size = max(1, int(chunk_size))
     self.seed = seed
+    self.current_version = int(initial_policy_version)
     self.start_method = _resolve_start_method(agent.device, mp_start_method)
     self.ctx = mp.get_context(self.start_method)
     self.stop_event = self.ctx.Event()
@@ -1096,6 +1192,7 @@ class AsyncActorPool:
           worker_seed,
           agent_config,
           network_state,
+          self.current_version,
           self.result_queue,
           self.weight_queues[actor_id],
           self.stop_event,
@@ -1105,11 +1202,13 @@ class AsyncActorPool:
       process.start()
       self.processes.append(process)
 
-  def broadcast_weights(self) -> None:
+  def broadcast_weights(self, policy_version: int) -> None:
     """Sends the learner's latest network weights to every actor."""
+    self.current_version = int(policy_version)
     network_state = _cpu_state_dict(self.agent.network.state_dict())
     for weights_queue in self.weight_queues:
-      _put_latest_network_state(weights_queue, network_state)
+      _put_latest_network_state(
+          weights_queue, self.current_version, network_state)
 
   def get_result(self, timeout: float = 1.0):
     """Returns one actor result, or raises if an actor has failed."""
@@ -1147,6 +1246,30 @@ class AsyncActorPool:
         queue_obj.close()
       except (AttributeError, OSError):
         pass
+
+
+def _add_actor_result_to_replay(result,
+                                replay_buffer: TransitionReplayBuffer,
+                                min_policy_version: int) -> Tuple[int, int]:
+  """Adds one actor result to replay, returning (fresh_samples, stale_batches)."""
+  result_type = result[0]
+  actor_id = result[1]
+  if result_type == "error":
+    raise RuntimeError(
+        f"Actor {actor_id} failed while collecting self-play:\n{result[2]}")
+  if result_type != "batch":
+    raise RuntimeError(f"Unknown actor result type: {result_type!r}")
+  if len(result) != 4:
+    raise RuntimeError(
+        "Actor batch payload is missing a policy version. "
+        f"Got result tuple with {len(result)} items.")
+
+  policy_version = int(result[2])
+  transitions = result[3]
+  if policy_version < min_policy_version:
+    return 0, 1
+  replay_buffer.add(transitions, policy_version=policy_version)
+  return len(transitions), 0
 
 
 def evaluate_vs_random(agent: PracticalACHAgent,
@@ -1201,6 +1324,7 @@ def train_practical_ach(
     actor_batch_size: Optional[int] = None,
     actor_update_interval: int = 1,
     actor_queue_capacity: int = 2,
+    max_actor_lag: int = 2,
     eval_freq: int = 50,
     eval_games: int = 200,
     save_interval_seconds: float = 3600.0,
@@ -1260,9 +1384,10 @@ def train_practical_ach(
   actor_chunk_size = max(1, int(actor_chunk_size))
   actor_update_interval = max(1, int(actor_update_interval))
   actor_queue_capacity = max(1, int(actor_queue_capacity))
+  max_actor_lag = max(0, int(max_actor_lag))
   if replay_buffer_capacity is None:
     replay_buffer_capacity = max(
-        batch_size * 4,
+        batch_size,
         resolved_workers * actor_chunk_size * actor_queue_capacity)
   replay_buffer_capacity = max(batch_size, int(replay_buffer_capacity))
   replay_buffer = TransitionReplayBuffer(
@@ -1279,36 +1404,50 @@ def train_practical_ach(
           chunk_size=actor_chunk_size,
           seed=seed,
           mp_start_method=mp_start_method,
-          queue_capacity=actor_queue_capacity)
+          queue_capacity=actor_queue_capacity,
+          initial_policy_version=start_iteration)
       actor_pool.start()
       print(
           f"Using {resolved_workers} asynchronous actor process(es), "
           f"chunk_size={actor_chunk_size}, "
           f"replay_capacity={replay_buffer.capacity}, "
+          f"max_actor_lag={max_actor_lag}, "
           f"start_method={actor_pool.start_method}")
 
     for iteration in range(start_iteration + 1, num_iterations + 1):
-      while not replay_buffer.can_sample(batch_size):
-        if actor_pool is None:
-          raise RuntimeError("Actor pool was not started.")
+      if actor_pool is None:
+        raise RuntimeError("Actor pool was not started.")
+      min_policy_version = max(0, actor_pool.current_version - max_actor_lag)
+      replay_buffer.drop_older_than(min_policy_version)
+
+      added_samples = 0
+      stale_actor_batches = 0
+      while (not replay_buffer.can_sample(batch_size)) or added_samples == 0:
         try:
           result = actor_pool.get_result(timeout=1.0)
         except queue.Empty:
           continue
+        added, stale = _add_actor_result_to_replay(
+            result, replay_buffer, min_policy_version)
+        added_samples += added
+        stale_actor_batches += stale
 
-        result_type, actor_id, payload = result
-        if result_type == "error":
-          raise RuntimeError(
-              f"Actor {actor_id} failed while collecting self-play:\n{payload}")
-        if result_type != "batch":
-          raise RuntimeError(f"Unknown actor result type: {result_type!r}")
-        replay_buffer.add(payload)
+      while True:
+        try:
+          result = actor_pool.get_result(timeout=0.0)
+        except queue.Empty:
+          break
+        added, stale = _add_actor_result_to_replay(
+            result, replay_buffer, min_policy_version)
+        added_samples += added
+        stale_actor_batches += stale
 
       batch = replay_buffer.sample(batch_size)
 
+      agent.set_training_progress(iteration - 1, num_iterations)
       metrics = agent.update(batch)
       if actor_pool is not None and iteration % actor_update_interval == 0:
-        actor_pool.broadcast_weights()
+        actor_pool.broadcast_weights(policy_version=iteration)
       last_completed_iteration = iteration
 
       if eval_freq and iteration % eval_freq == 0:
@@ -1318,20 +1457,28 @@ def train_practical_ach(
           print(
               f"Iter {iteration:>5}/{num_iterations}  "
               f"Samples={len(batch):>4}  "
+              f"Fresh={added_samples:>4}  "
               f"Replay={len(replay_buffer):>5}  "
+              f"Stale={stale_actor_batches:>2}  "
               f"WinRate={win_rate:.0%}  "
               f"AvgRet={avg_return:+.3f}  "
               f"Loss={metrics['loss']:.4f}  "
               f"PiL={metrics['policy_loss']:.4f}  "
-              f"VL={metrics['value_loss']:.4f}")
+              f"VL={metrics['value_loss']:.4f}  "
+              f"LR={metrics['learning_rate']:.2e}  "
+              f"Clip={metrics['clip_ratio']:.3f}")
         else:
           print(
               f"Iter {iteration:>5}/{num_iterations}  "
               f"Samples={len(batch):>4}  "
+              f"Fresh={added_samples:>4}  "
               f"Replay={len(replay_buffer):>5}  "
+              f"Stale={stale_actor_batches:>2}  "
               f"Loss={metrics['loss']:.4f}  "
               f"PiL={metrics['policy_loss']:.4f}  "
-              f"VL={metrics['value_loss']:.4f}")
+              f"VL={metrics['value_loss']:.4f}  "
+              f"LR={metrics['learning_rate']:.2e}  "
+              f"Clip={metrics['clip_ratio']:.3f}")
 
       if save_interval_seconds > 0:
         now = time.time()
@@ -1451,10 +1598,10 @@ def _parse_args() -> argparse.Namespace:
       type=int,
       default=None,
       help=(
-          "Maximum learner replay-buffer samples. Defaults to at least four "
-          "learner batches."))
-  parser.add_argument("--eval_freq", type=int, default=1000)
-  parser.add_argument("--eval_games", type=int, default=200)
+          "Maximum learner replay-buffer samples. Defaults to enough space for "
+          "one learner batch or queued actor chunks, whichever is larger."))
+  parser.add_argument("--eval_freq", type=int, default=100)
+  parser.add_argument("--eval_games", type=int, default=1000)
   parser.add_argument("--save_interval_seconds", type=float, default=3600.0)
   parser.add_argument("--checkpoint_dir", default="checkpoints")
   parser.add_argument("--checkpoint_prefix", default="ach_practical")
@@ -1487,6 +1634,11 @@ def _parse_args() -> argparse.Namespace:
       type=int,
       default=2,
       help="Maximum queued rollout chunks per actor before actors apply backpressure.")
+  parser.add_argument(
+      "--max_actor_lag",
+      type=int,
+      default=2,
+      help="Drop actor chunks more than this many broadcasts behind the learner.")
   parser.add_argument("--mp_start_method", default=None)
   parser.add_argument(
       "--aux_feature_channels",
@@ -1499,7 +1651,7 @@ def _parse_args() -> argparse.Namespace:
 
   parser.add_argument(
       "--conv_channels",
-      default="64,128,32",
+      default="32,64,128",
       help="Comma-separated residual stage widths for image-like inputs.")
   parser.add_argument(
       "--residual_blocks_per_stage",
@@ -1532,16 +1684,29 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
       "--value_coef", type=float, default=PAPER_MAHJONG_VALUE_COEF)
   parser.add_argument("--eta", type=float, default=PAPER_MAHJONG_ETA)
+  parser.add_argument(
+      "--min_behavior_prob",
+      type=float,
+      default=PAPER_MAHJONG_MIN_BEHAVIOR_PROB,
+      help="Lower bound for the behavior-policy probability in the ACH loss.")
   parser.add_argument("--max_grad_norm", type=float, default=0.5)
   parser.add_argument("--update_epochs", type=int, default=1)
   parser.add_argument("--num_minibatches", type=int, default=1)
   parser.add_argument(
       "--normalize_advantages",
       action="store_true",
-      help="Normalize GAE advantages inside each minibatch.")
+      help="Normalize GAE advantages once over each learner batch.")
+  parser.add_argument(
+      "--no_lr_decay",
+      action="store_true",
+      help="Disable cosine decay of the learner learning rate.")
+  parser.add_argument(
+      "--no_clip_decay",
+      action="store_true",
+      help="Disable cosine decay of the ACH clip range.")
   parser.add_argument(
       "--device",
-      default=None,
+      default="cpu",
       help="Torch device, e.g. cpu or cuda. Defaults to CUDA if available.")
   return parser.parse_args()
 
@@ -1566,6 +1731,7 @@ def main() -> None:
       actor_batch_size=args.actor_batch_size,
       actor_update_interval=args.actor_update_interval,
       actor_queue_capacity=args.actor_queue_capacity,
+      max_actor_lag=args.max_actor_lag,
       eval_freq=args.eval_freq,
       eval_games=args.eval_games,
       save_interval_seconds=args.save_interval_seconds,
@@ -1588,10 +1754,13 @@ def main() -> None:
       entropy_coef=args.entropy_coef,
       value_coef=args.value_coef,
       eta=args.eta,
+      min_behavior_prob=args.min_behavior_prob,
       max_grad_norm=args.max_grad_norm,
       update_epochs=args.update_epochs,
       num_minibatches=args.num_minibatches,
       normalize_advantages=args.normalize_advantages,
+      lr_decay=not args.no_lr_decay,
+      clip_decay=not args.no_clip_decay,
       device=args.device)
 
 
